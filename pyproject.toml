@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "w1x-cli"
+version = "3.5.0"
+description = "A fast, keyboard-first CLI terminal assistant for Ollama with Function Calling, Persistent Memory, and Python Sandbox."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "W1bbex" }
+]
+keywords = ["ollama", "cli", "terminal", "ai", "llm", "chat", "tools", "python-sandbox"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: User Interfaces",
+]
+dependencies = [
+    "ollama>=0.4.0",
+    "rich>=13.7.0",
+    "prompt_toolkit>=3.0.43",
+    "requests>=2.31.0",
+    "duckduckgo_search>=7.0.0",
+]
+
+[project.scripts]
+w1x = "w1x.app:main"
+
+[project.urls]
+Homepage = "https://github.com/w1bbex/w1x-cli"
+Issues = "https://github.com/w1bbex/w1x-cli/issues"
