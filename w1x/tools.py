@@ -12,7 +12,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
-from ddgs import DDGS
+try:
+    from duckduckgo_search import DDGS
+except ImportError:
+    from ddgs import DDGS
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.tree import Tree

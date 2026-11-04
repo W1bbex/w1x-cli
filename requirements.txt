@@ -2,5 +2,4 @@ ollama>=0.4.0
 rich>=13.7.0
 prompt_toolkit>=3.0.43
 requests>=2.31.0
-ddg3>=0.6.9
 duckduckgo_search>=7.0.0
