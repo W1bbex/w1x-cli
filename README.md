@@ -3,6 +3,7 @@
 > **A fast, keyboard-first CLI terminal client for Ollama with Function Calling, Persistent Memory, and Interactive Python Runner.**
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)
+[![PyPI](https://img.shields.io/pypi/v/w1x-cli?color=blue&logo=pypi)](https://pypi.org/project/w1x-cli/)
 ![Ollama](https://img.shields.io/badge/Ollama-Compatible-black?logo=ollama)
 ![License](https://img.shields.io/badge/License-MIT-green)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-brightgreen)
@@ -44,7 +45,13 @@ W1x — это легковесный, отзывчивый терминальн
 1. Установленный **[Ollama](https://ollama.com/)** (модели можно выбрать прямо при первом запуске W1x).
 2. **Python 3.10+**
 
-### Установка (Windows)
+### Вариант 1. Установка через PyPI (Рекомендуется)
+
+`ash
+pip install --upgrade w1x-cli
+`
+
+### Вариант 2. Установка из исходников (Windows / Linux / macOS)
 
 Просто запустите **`install.bat`** или выполните в терминале:
 

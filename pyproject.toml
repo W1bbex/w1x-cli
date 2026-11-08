@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "w1x-cli"
-version = "3.5.0"
+version = "3.5.1"
 description = "A fast, keyboard-first CLI terminal assistant for Ollama with Function Calling, Persistent Memory, and Interactive Python Runner."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -43,3 +43,4 @@ Issues = "https://github.com/w1bbex/w1x-cli/issues"
 
 [tool.pytest.ini_options]
 addopts = "--basetemp=.pytest_temp"
+pythonpath = ["."]
