@@ -7,8 +7,10 @@ import operator
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -58,11 +60,13 @@ def search_web(query: str) -> str:
     search = DDGS(timeout=12)
     for region in regions:
         try:
-            region_results = search.text(
-                query,
-                region=region,
-                safesearch="off",
-                max_results=5,
+            region_results = list(
+                search.text(
+                    query,
+                    region=region,
+                    safesearch="off",
+                    max_results=5,
+                )
             )
         except Exception:
             continue
@@ -134,17 +138,26 @@ def _format_datetime_ru(value):
     )
 
 
-def _format_offset(days, hours, minutes, seconds):
+def _format_offset(delta: timedelta | None = None, days: int = 0, hours: int = 0, minutes: int = 0, seconds: int = 0) -> str:
+    if delta is None:
+        delta = timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
+    total_seconds = int(abs(delta.total_seconds()))
+    d = total_seconds // 86400
+    rem = total_seconds % 86400
+    h = rem // 3600
+    rem = rem % 3600
+    m = rem // 60
+    s = rem % 60
     parts = []
-    if days:
-        parts.append(f"{abs(days)} {_plural_ru(days, 'день', 'дня', 'дней')}")
-    if hours:
-        parts.append(f"{abs(hours)} {_plural_ru(hours, 'час', 'часа', 'часов')}")
-    if minutes:
-        parts.append(f"{abs(minutes)} {_plural_ru(minutes, 'минута', 'минуты', 'минут')}")
-    if seconds:
-        parts.append(f"{abs(seconds)} {_plural_ru(seconds, 'секунда', 'секунды', 'секунд')}")
-    return " ".join(parts) or "0 минут"
+    if d:
+        parts.append(f"{d} {_plural_ru(d, 'день', 'дня', 'дней')}")
+    if h:
+        parts.append(f"{h} {_plural_ru(h, 'час', 'часа', 'часов')}")
+    if m:
+        parts.append(f"{m} {_plural_ru(m, 'минута', 'минуты', 'минут')}")
+    if s:
+        parts.append(f"{s} {_plural_ru(s, 'секунда', 'секунды', 'секунд')}")
+    return " ".join(parts) or "0 секунд"
 
 
 def calculate_datetime(
@@ -166,10 +179,16 @@ def calculate_datetime(
     Returns:
         JSON с готовым полем answer, которое нельзя пересчитывать или изменять.
     """
-    days = int(days)
-    hours = int(hours)
-    minutes = int(minutes)
-    seconds = int(seconds)
+    try:
+        days = int(float(days or 0))
+        hours = int(float(hours or 0))
+        minutes = int(float(minutes or 0))
+        seconds = int(float(seconds or 0))
+    except (ValueError, TypeError):
+        return json.dumps(
+            {"error": "Некорректные параметры смещения времени."},
+            ensure_ascii=False,
+        )
     if (
         abs(days) > 365000
         or abs(hours) > 1_000_000
@@ -211,7 +230,7 @@ def calculate_datetime(
         answer = f"{base_label}: {current_text}."
     else:
         direction = "назад" if delta.total_seconds() < 0 else "вперёд"
-        offset_text = _format_offset(days, hours, minutes, seconds)
+        offset_text = _format_offset(delta)
         answer = (
             f"{base_label}: {current_text}.\n"
             f"{offset_text.capitalize()} {direction}: "
@@ -429,16 +448,35 @@ def _evaluate_math_node(node):
     if isinstance(node, ast.Expression):
         return _evaluate_math_node(node.body)
     if isinstance(node, ast.Constant) and type(node.value) in {int, float}:
-        return node.value
+        return Decimal(str(node.value))
     if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPERATORS:
         return _UNARY_OPERATORS[type(node.op)](_evaluate_math_node(node.operand))
     if isinstance(node, ast.BinOp) and type(node.op) in _BINARY_OPERATORS:
         left = _evaluate_math_node(node.left)
         right = _evaluate_math_node(node.right)
-        if isinstance(node.op, ast.Pow) and abs(right) > 1000:
-            raise ValueError("Слишком большая степень")
+        if isinstance(node.op, ast.Pow):
+            if abs(right) > 1000:
+                raise ValueError("Слишком большая степень")
+            if right == int(right):
+                return left ** int(right)
+            return left ** right
         return _BINARY_OPERATORS[type(node.op)](left, right)
     raise ValueError("Разрешены только числа, скобки и операции + - * / // % **")
+
+
+def _format_math_result(val) -> str:
+    if isinstance(val, Decimal):
+        if not val.is_finite():
+            return str(val)
+        val_norm = val.normalize()
+        sign, digits, exponent = val_norm.as_tuple()
+        if exponent > 0:
+            return str(int(val_norm))
+        formatted = f"{val_norm:f}"
+        if "." in formatted:
+            formatted = formatted.rstrip("0").rstrip(".")
+        return formatted or "0"
+    return str(val)
 
 
 def calculate_expression(expression: str) -> str:
@@ -455,7 +493,8 @@ def calculate_expression(expression: str) -> str:
         return "Ошибка: выражение пустое или слишком длинное."
     try:
         tree = ast.parse(expression, mode="eval")
-        return str(_evaluate_math_node(tree))
+        result = _evaluate_math_node(tree)
+        return _format_math_result(result)
     except Exception as error:
         return f"Ошибка вычисления: {type(error).__name__}: {error}"
 
@@ -545,16 +584,16 @@ def run_python_code(code: str, purpose: str, inputs: str = "") -> str:
         )
     )
     console.print(
-        "[green]Нажми [bold]Enter[/bold] для запуска. Чтобы отклонить — введи [bold]n[/bold] или [bold]нет[/bold].[/green]"
+        "[yellow]Для подтверждения введите [bold]y[/bold] или [bold]да[/bold]. Нажатие Enter или любой другой ввод отклонит запуск.[/yellow]"
     )
     try:
         confirmation = session.prompt(
-            HTML("<b><ansigreen>Разрешить запуск? [Y/n] › </ansigreen></b>"),
+            HTML("<b><ansiyellow>Разрешить запуск кода? [y/N] › </ansiyellow></b>"),
             multiline=False,
         ).strip().lower()
     except (KeyboardInterrupt, EOFError):
         confirmation = "n"
-    if confirmation in {"n", "no", "н", "нет", "cancel", "отмена"}:
+    if confirmation not in {"y", "yes", "д", "да"}:
         return "Пользователь отказался запускать код."
 
     try:
@@ -604,6 +643,7 @@ def set_file_workspace(path_text):
     if not path.is_dir():
         raise ValueError("Указанный путь не является папкой.")
     config.ACTIVE_FILE_ROOT = path
+    ACTIVE_FILE_ROOT = path
     return path
 
 
@@ -760,7 +800,10 @@ def ask_antigravity(task: str, context: str = "") -> str:
     except subprocess.TimeoutExpired:
         if process is not None:
             process.kill()
-            stdout, stderr = process.communicate()
+            try:
+                stdout, stderr = process.communicate(timeout=2)
+            except Exception:
+                pass
         return f"ESCALATE_ERROR: Antigravity не ответила за {AGY_TIMEOUT_SECONDS} секунд."
     except (OSError, PermissionError) as error:
         return f"ESCALATE_ERROR: не удалось запустить agy: {error}"

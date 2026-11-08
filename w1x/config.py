@@ -49,16 +49,21 @@ def load_user_config():
 
 def save_user_config(cfg):
     try:
-        CONFIG_FILE_PATH.write_text(
+        tmp_path = CONFIG_FILE_PATH.with_suffix(".tmp")
+        tmp_path.write_text(
             json.dumps(cfg, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        tmp_path.replace(CONFIG_FILE_PATH)
     except Exception:
         pass
 
 
 def get_keep_alive():
-    mins = load_user_config().get("keep_alive_minutes", 30)
+    try:
+        mins = int(load_user_config().get("keep_alive_minutes", 30))
+    except Exception:
+        mins = 30
     if mins <= 0:
         return "0"
     return f"{mins}m"

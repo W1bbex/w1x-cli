@@ -280,6 +280,10 @@ def generate_answer(model, messages, think_mode):
     math_candidates = re.findall(r"[\d\s().,+\-*/%]{3,}", last_user_text.replace("×", "*").replace("÷", "/"))
     for cand in math_candidates:
         cand_clean = cand.strip(" ,.")
+        if re.search(r"\b\d{4}-\d{2}-\d{2}\b", cand_clean) or re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", cand_clean):
+            continue
+        if re.search(r"^\+?\d[\d\s-]{7,}\d$", cand_clean):
+            continue
         if re.search(r"[+\-*/%]", cand_clean) and re.search(r"\d", cand_clean) and len(cand_clean) >= 3:
             val = calculate_expression(cand_clean)
             if not val.startswith("Ошибка"):

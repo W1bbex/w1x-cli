@@ -148,6 +148,9 @@ class TeeStream:
     def isatty(self):
         return getattr(self.original, "isatty", lambda: True)()
 
+    def __getattr__(self, name):
+        return getattr(self.original, name)
+
 
 def clear_input_buffer():
     if os.name == "nt":
@@ -228,7 +231,7 @@ def main():
                         global_scope[ep]()
                         break
         except SystemExit as exc:
-            exit_code = exc.code if isinstance(exc.code, int) else 0
+            exit_code = exc.code if isinstance(exc.code, int) else (1 if exc.code is not None else 0)
         except KeyboardInterrupt:
             exit_code = 130
             print("\\n[Выполнение остановлено пользователем (Ctrl+C)]")
@@ -297,29 +300,30 @@ if __name__ == "__main__":
     console.print("[dim]Окно открыто. Протестируйте программу и завершите её для возврата в чат.[/dim]")
 
     creation_flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if os.name == "nt" else 0
-    subprocess.run(
-        [sys.executable, str(runner_file)],
-        creationflags=creation_flags,
-        check=False,
-    )
-
     exit_code = 0
-    if exit_code_file.exists():
-        try:
-            exit_code = int(exit_code_file.read_text(encoding="utf-8").strip())
-        except Exception:
-            exit_code = 0
-
     log_content = ""
-    if log_file.exists():
-        try:
-            log_content = log_file.read_text(encoding="utf-8", errors="replace").strip()
-        except Exception:
-            log_content = ""
-
     try:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-    except Exception:
-        pass
+        subprocess.run(
+            [sys.executable, str(runner_file)],
+            creationflags=creation_flags,
+            check=False,
+        )
+
+        if exit_code_file.exists():
+            try:
+                exit_code = int(exit_code_file.read_text(encoding="utf-8").strip())
+            except Exception:
+                exit_code = 0
+
+        if log_file.exists():
+            try:
+                log_content = log_file.read_text(encoding="utf-8", errors="replace").strip()
+            except Exception:
+                log_content = ""
+    finally:
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
     return exit_code, log_content

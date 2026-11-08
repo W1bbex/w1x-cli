@@ -386,6 +386,10 @@ class DownloadTask:
         self.status_msg = "В очереди"
         self.error_msg = ""
 
+    @property
+    def error(self) -> str:
+        return self.error_msg
+
 
 class AsyncPullManager:
     def __init__(self):
@@ -458,8 +462,9 @@ class AsyncPullManager:
             with self._lock:
                 if self.queue:
                     current_model = self.queue.pop(0)
-            if not current_model:
-                break
+                else:
+                    self._worker_thread = None
+                    break
 
             with self._lock:
                 task = self.tasks.get(current_model)
@@ -724,6 +729,7 @@ class PullQueue:
             console.print(f"  - {n}")
         console.print()
         done = 0
+        successful = 0
         while True:
             current = None
             with self._lock:
@@ -733,8 +739,12 @@ class PullQueue:
                 break
             done += 1
             console.print(f"[cyan]▶ [{done}/{total}][/cyan] {current}")
-            pull_model(current)
-        console.print(f"[bold green]Готово: {done}/{total} скачано[/bold green]\n")
+            if pull_model(current):
+                successful += 1
+            else:
+                console.print(f"[yellow]Очередь остановлена после прерывания {current}.[/yellow]")
+                break
+        console.print(f"[bold green]Готово: {successful}/{total} скачано[/bold green]\n")
 
 
 GLOBAL_PULL_QUEUE = PullQueue()
@@ -790,6 +800,11 @@ def _poll_key_unix():
                         return "PGDN"
                     if ch3 == "H": return "HOME"
                     if ch3 == "F": return "END"
+                elif ch2 == "O":
+                    ch3 = sys.stdin.read(1)
+                    if ch3 == "A": return "UP"
+                    if ch3 == "B": return "DOWN"
+                return None
             return "EXIT"
         if ch in ("\r", "\n"): return "ENTER"
         if ch in ("q", "Q"): return "EXIT"
@@ -936,6 +951,18 @@ def first_time_setup_wizard() -> Optional[str]:
             time.sleep(0.5)
 
     if selected:
+        if task and task.status == "error":
+            console.print(
+                Panel(
+                    f"[bold red]Ошибка загрузки {selected}: {task.error_msg or 'Сбой соединения'}[/bold red]\n"
+                    "Модель не была установлена как модель по умолчанию.\n"
+                    "[dim]Попробуйте скачать повторно через /pull[/dim]",
+                    title="Ошибка загрузки",
+                    border_style="red",
+                    padding=(1, 2),
+                )
+            )
+            return None
         from .config import load_user_config, save_user_config
         cfg = load_user_config()
         cfg["default_model"] = selected

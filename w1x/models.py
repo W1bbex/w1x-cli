@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import threading
+from typing import Optional
 from ollama import generate, list as ollama_list, ps
 from rich.table import Table
 from rich.panel import Panel
@@ -37,6 +38,11 @@ def _start_global_ctrl_q_listener():
         while True:
             time.sleep(0.04)
             try:
+                # Только если окно консоли находится на переднем плане
+                kernel32 = ctypes.windll.kernel32
+                console_hwnd = kernel32.GetConsoleWindow()
+                if console_hwnd and user32.GetForegroundWindow() != console_hwnd:
+                    continue
                 # 0x11: VK_CONTROL, 0x51: VK_Q
                 ctrl_down = bool(user32.GetAsyncKeyState(0x11) & 0x8000)
                 q_down = bool(user32.GetAsyncKeyState(0x51) & 0x8000)
@@ -127,63 +133,77 @@ if os.name == "nt":
         pass
 
 
-def reset_all_models():
+def reset_all_models(show_message: bool = False):
     return unload_all_models()
 
 
-_PRELOAD_THREAD = None
-_PRELOAD_EVENT = threading.Event()
-_PRELOAD_ERROR = None
-_PRELOADED_MODEL = None
+class PreloadTask:
+    def __init__(self, name: str):
+        self.name = name
+        self.event = threading.Event()
+        self.error = None
+        self.thread = None
 
 
-def _background_preload_worker(name):
-    global _PRELOAD_ERROR, _PRELOADED_MODEL
+_CURRENT_PRELOAD: Optional[PreloadTask] = None
+_PRELOAD_LOCK = threading.Lock()
+
+
+def _background_preload_worker(task: PreloadTask):
     try:
         generate(
-            model=name,
+            model=task.name,
             prompt="",
             keep_alive=get_keep_alive(),
             options={"num_ctx": get_context_tokens()},
         )
-        _PRELOADED_MODEL = name
     except Exception as e:
-        _PRELOAD_ERROR = e
+        task.error = e
     finally:
-        _PRELOAD_EVENT.set()
+        task.event.set()
 
 
-def start_background_preload(name):
-    global _PRELOAD_THREAD, _PRELOAD_EVENT, _PRELOAD_ERROR, _PRELOADED_MODEL
-    _PRELOAD_EVENT.clear()
-    _PRELOAD_ERROR = None
-    _PRELOADED_MODEL = None
-    _PRELOAD_THREAD = threading.Thread(
-        target=_background_preload_worker,
-        args=(name,),
-        daemon=True,
-        name=f"Preload-{name}",
-    )
-    _PRELOAD_THREAD.start()
+def start_background_preload(name: str):
+    global _CURRENT_PRELOAD
+    with _PRELOAD_LOCK:
+        if _CURRENT_PRELOAD is not None and _CURRENT_PRELOAD.name == name and not _CURRENT_PRELOAD.event.is_set():
+            return
+        task = PreloadTask(name)
+        task.thread = threading.Thread(
+            target=_background_preload_worker,
+            args=(task,),
+            daemon=True,
+            name=f"Preload-{name}",
+        )
+        _CURRENT_PRELOAD = task
+        task.thread.start()
 
 
 def wait_for_model_ready(name=None):
     """Подождать готовность модели перед отправкой первого запроса (если она ещё догружается в фоне)."""
-    global _PRELOAD_EVENT, _PRELOAD_ERROR, _PRELOAD_THREAD
-    if _PRELOAD_THREAD is None:
+    global _CURRENT_PRELOAD
+    with _PRELOAD_LOCK:
+        task = _CURRENT_PRELOAD
+    if task is None:
+        return
+    if name and task.name != name:
         return
 
-    if _PRELOAD_EVENT.is_set():
-        if _PRELOAD_ERROR:
-            raise _PRELOAD_ERROR
+    if task.event.is_set():
+        if task.error:
+            with _PRELOAD_LOCK:
+                _CURRENT_PRELOAD = None
+            raise task.error
         return
 
     run_with_spinner(
-        f"Догружаю {name or _PRELOADED_MODEL or 'модель'} в память...",
-        _PRELOAD_EVENT.wait,
+        f"Догружаю {name or task.name or 'модель'} в память...",
+        task.event.wait,
     )
-    if _PRELOAD_ERROR:
-        raise _PRELOAD_ERROR
+    if task.error:
+        with _PRELOAD_LOCK:
+            _CURRENT_PRELOAD = None
+        raise task.error
 
 
 def preload_model(name):
@@ -339,40 +359,6 @@ def choose_model(current=None):
     save_last_model(chosen)
     console.print(render_models_panel(models, selected_idx, active_in_vram))
     return chosen
-
-    # Фоллбек для обычного ввода
-    print_models(models, default_model=default_model)
-    console.print(
-        f"[dim]Нажми [bold green]Enter[/bold green] для [bold green]{default_model}[/bold green], "
-        "или введи номер/имя. (q — выход)[/dim]"
-    )
-
-    while True:
-        prompt_html = f"<b><ansigreen>Модель [{default_model}] › </ansigreen></b>"
-        choice = session.prompt(
-            HTML(prompt_html)
-        ).strip()
-
-        if not choice:
-            if default_model:
-                save_last_model(default_model)
-                return default_model
-            if current:
-                return current
-        if choice.lower() in EXIT_COMMANDS:
-            return None
-        if choice.isdigit() and 1 <= int(choice) <= len(models):
-            selected = models[int(choice) - 1]
-            save_last_model(selected)
-            return selected
-        if choice in models:
-            save_last_model(choice)
-            return choice
-        matched = [m for m in models if choice.lower() in m.lower()]
-        if len(matched) == 1:
-            save_last_model(matched[0])
-            return matched[0]
-        console.print("[red]Такой установленной модели нет.[/red]")
 
 
 def interactive_config_menu():
