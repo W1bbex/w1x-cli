@@ -174,6 +174,8 @@ if os.name == "nt":
     _original_event_to_key_presses = ConsoleInputReader._event_to_key_presses
 
     def _event_to_key_presses_with_ctrl_backspace(self, event):
+        if not getattr(event, "KeyDown", getattr(event, "bKeyDown", True)):
+            return []
         ctrl_pressed = event.ControlKeyState & (
             self.LEFT_CTRL_PRESSED | self.RIGHT_CTRL_PRESSED
         )
@@ -312,8 +314,8 @@ def _is_multiline_paste_event(event) -> bool:
     key_processor = getattr(event.app, "key_processor", None)
     if key_processor and getattr(key_processor, "input_queue", None):
         if any(
-            not isinstance(k.key, Keys)
-            or k.key in {Keys.ControlM, Keys.ControlJ, Keys.BracketedPaste, Keys.Any}
+            (isinstance(k.key, str) and ("\n" in k.key or "\r" in k.key))
+            or k.key in {Keys.ControlM, Keys.ControlJ, Keys.BracketedPaste}
             for k in key_processor.input_queue
         ):
             _last_paste_burst_time = now
@@ -396,6 +398,13 @@ def exit_app_ctrl_q(event):
 @bindings.add("c-s")
 def undo_and_restore_prompt(event):
     from .app import save_current_chat
+    cancelled_prompt = ACTIVE_SESSION_DATA.pop("cancelled_prompt", "")
+    if cancelled_prompt:
+        buffer = event.app.current_buffer
+        buffer.text = cancelled_prompt
+        buffer.cursor_position = len(buffer.text)
+        return
+
     messages = ACTIVE_SESSION_DATA.get("messages", [])
     system_prompt = ACTIVE_SESSION_DATA.get("system_prompt", "")
     last_user_prompt = ""

@@ -43,7 +43,21 @@ Ollama Chats/
 *.sublime-project
 *.sublime-workspace
 
+# Internal Agent & Audit Artifacts (DO NOT PUBLISH)
+CRITIQUE_REPORT.md
+CRITIC*.md
+PROJECT.md
+ARCHITECTURE.md
+IDEAS.md
+AUDIT*.md
+REVIEW*.md
+TODO.md
+.reviews/
+
 # OS
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+.pytest_temp/
+.pytest_cache/

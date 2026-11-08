@@ -3,12 +3,19 @@
 import json
 import re
 import secrets
+import shutil
+import time
 from datetime import datetime
 
-from .config import (
-    CHAT_DIR,
-    FACTS_PATH,
-)
+from . import config
+
+
+def _get_facts_path():
+    return getattr(config, "FACTS_PATH", None)
+
+
+def _get_chat_dir():
+    return getattr(config, "CHAT_DIR", None)
 
 _MEMORY_STOPWORDS = {
     "а", "в", "вы", "где", "для", "его", "ее", "и", "как", "какая",
@@ -29,11 +36,23 @@ _GENERAL_MEMORY_PATTERNS = (
 
 def load_facts():
     """Загрузить отдельную постоянную память фактов."""
-    if not FACTS_PATH.exists():
+    facts_p = _get_facts_path()
+    if not facts_p or not facts_p.exists():
         return []
     try:
-        payload = json.loads(FACTS_PATH.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
+        facts_p = _get_facts_path()
+        payload = json.loads(facts_p.read_text(encoding="utf-8"))
+    except (ValueError, TypeError):
+        try:
+            corrupt_p = facts_p.with_name(f"{facts_p.stem}.corrupted.{int(time.time())}.json")
+            shutil.move(facts_p, corrupt_p)
+        except Exception:
+            try:
+                facts_p.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return []
+    except OSError:
         return []
     if not isinstance(payload, list):
         return []
@@ -47,13 +66,14 @@ def load_facts():
 
 
 def save_facts(facts):
-    CHAT_DIR.mkdir(parents=True, exist_ok=True)
-    temporary_path = FACTS_PATH.with_suffix(".tmp")
+    _get_chat_dir().mkdir(parents=True, exist_ok=True)
+    facts_p = _get_facts_path()
+    temporary_path = facts_p.with_suffix(".tmp")
     temporary_path.write_text(
         json.dumps(facts, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    temporary_path.replace(FACTS_PATH)
+    temporary_path.replace(facts_p)
 
 
 def remember_fact(fact: str) -> str:
@@ -184,7 +204,7 @@ def forget_facts(query: str) -> str:
     removed = []
     for item in facts:
         fact_words = _memory_words(item["fact"])
-        match = any(qw in fact_words for qw in query_words)
+        match = all(qw in fact_words for qw in query_words)
         if match:
             removed.append(item["fact"])
         else:

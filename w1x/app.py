@@ -126,6 +126,8 @@ def load_current_chat():
 
     try:
         state = json.loads(CURRENT_CHAT_PATH.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            return DEFAULT_SYSTEM_PROMPT, new_context(DEFAULT_SYSTEM_PROMPT)
         saved_system_prompt = state.get("system_prompt") or ""
         has_custom_prompt = state.get("custom_system_prompt") is True
         system_prompt = (
@@ -154,7 +156,7 @@ def load_current_chat():
             {"role": "system", "content": system_prompt},
             *saved_messages[-MAX_SAVED_MESSAGES:],
         ]
-    except (OSError, ValueError, TypeError) as error:
+    except (OSError, ValueError, TypeError, AttributeError) as error:
         console.print(f"[yellow]Не удалось восстановить память: {error}[/yellow]")
         return DEFAULT_SYSTEM_PROMPT, new_context(DEFAULT_SYSTEM_PROMPT)
 
@@ -340,7 +342,7 @@ def main():
     migrated_facts = migrate_explicit_memory(messages)
     save_current_chat(system_prompt, messages)
     think_mode = False
-    stats_enabled = False
+    stats_enabled = bool(load_user_config().get("stats_enabled", False))
     last_stats = None
     totals = empty_totals()
     last_response = next(
@@ -723,6 +725,9 @@ def main():
                 think_mode,
             )
         except Exception as error:
+            if messages and messages[-1].get("role") == "user":
+                messages.pop()
+                save_current_chat(system_prompt, messages)
             console.print(
                 f"\n[bold red]Ошибка Ollama:[/bold red] "
                 f"{type(error).__name__}: {error}"
@@ -730,6 +735,7 @@ def main():
             continue
 
         if interrupted:
+            ACTIVE_SESSION_DATA["cancelled_prompt"] = user_input
             if messages and messages[-1].get("role") == "user":
                 messages.pop()
                 save_current_chat(system_prompt, messages)
