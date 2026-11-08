@@ -2,7 +2,7 @@ import json
 import threading
 from pathlib import Path
 
-APP_VERSION = "3.5"
+APP_VERSION = "3.5.1"
 EXIT_COMMANDS = {"q", "/q", "quit", "/quit", "exit", "/exit"}
 SPINNER = ["|", "/", "-", "\\"]
 SPINNER_DELAY = 0.16
