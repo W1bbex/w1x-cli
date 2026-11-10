@@ -42,7 +42,7 @@ def is_valid_python(code_str: str) -> bool:
             for node in ast.walk(tree)
         )
         return has_logic
-    except SyntaxError:
+    except (SyntaxError, ValueError):
         return False
 
 

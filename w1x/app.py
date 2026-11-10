@@ -15,6 +15,7 @@ from .config import (
     DEFAULT_SYSTEM_PROMPT,
     EXIT_COMMANDS,
     ACTIVE_SESSION_DATA,
+    load_user_config,
 )
 from .terminal import (
     console,
@@ -261,70 +262,224 @@ def looks_like_launch_command(text):
     )
 
 
+def _print_tools_panel():
+    console.print(
+        Panel(
+            "[bold]search_web[/bold] — поиск свежей информации\n"
+            "[bold]calculate_datetime[/bold] — дата, время и точные смещения\n"
+            "[bold]calculate_expression[/bold] — точная арифметика\n"
+            "[bold]run_python_code[/bold] — проверка Python, только после подтверждения\n"
+            "[bold]remember/recall/forget[/bold] — постоянная память фактов\n"
+            "[bold]list/read_project[/bold] — безопасное чтение выбранной папки\n"
+            "[bold]ask_antigravity[/bold] — старшая модель для сложных задач\n\n"
+            "[dim]Просто сформулируй задачу: модель сама выберет инструмент.[/dim]",
+            title="Инструменты",
+            border_style="magenta",
+        )
+    )
+
+
+def _handle_workspace_cmd(argument):
+    from . import config
+    if not argument:
+        console.print(
+            f"[dim]Текущая папка: {config.ACTIVE_FILE_ROOT or 'не выбрана'}[/dim]\n"
+            "Используй: [cyan]/workspace C:\\путь\\к\\проекту[/cyan] "
+            "или [cyan]/workspace off[/cyan]"
+        )
+        return
+    if argument.casefold() in {"off", "none", "выкл"}:
+        config.ACTIVE_FILE_ROOT = None
+        console.print("[green]Доступ к папке проекта отключён.[/green]")
+        return
+    try:
+        selected_root = set_file_workspace(argument.strip('"'))
+        console.print(
+            f"[green]Папка проекта выбрана только для чтения:[/green] {selected_root}"
+        )
+    except Exception as error:
+        console.print(f"[red]Не удалось выбрать папку: {error}[/red]")
+
+
+def _handle_think_cmd(argument, think_mode):
+    value = argument.lower()
+    if not value:
+        think_mode = False if think_mode else True
+    elif value in {"off", "false", "0"}:
+        think_mode = False
+    elif value in {"on", "true", "1"}:
+        think_mode = True
+    elif value in {"low", "medium", "high"}:
+        think_mode = value
+    else:
+        console.print("[red]Используй: /think off|on|low|medium|high[/red]")
+        return think_mode
+    label = "выключен" if not think_mode else str(think_mode)
+    console.print(f"[green]Thinking: {label}.[/green]")
+    return think_mode
+
+
+def _handle_memory_cmd(messages):
+    turns = sum(item["role"] == "user" for item in messages)
+    facts = load_facts()
+    fact_preview = "\n".join(
+        f"• {item['fact']}" for item in facts[-10:]
+    ) or "Постоянных фактов пока нет."
+    console.print(
+        Panel(
+            f"Сохранено сообщений пользователя: [bold]{turns}[/bold]\n"
+            f"Лимит истории: [bold]{MAX_SAVED_MESSAGES} сообщений[/bold]\n"
+            f"Постоянных фактов: [bold]{len(facts)}[/bold]\n"
+            f"Файл диалога: {CURRENT_CHAT_PATH}\n"
+            f"Файл фактов: {FACTS_PATH}\n\n"
+            f"{fact_preview}\n\n"
+            "[dim]/new очищает диалог, но не постоянные факты; "
+            "/forget текст удаляет факт[/dim]",
+            title="Постоянная память",
+            border_style="cyan",
+        )
+    )
+
+
+def _handle_testpy_cmd(argument, messages, system_prompt, last_response):
+    code_to_test = argument or extract_latest_python_code(messages)
+    if not code_to_test:
+        console.print("[yellow]В диалоге не найдено исполняемого Python-кода для тестирования.[/yellow]")
+        console.print("[dim]Подсказка: вы можете передать код напрямую: /testpy print('hello')[/dim]")
+        return last_response
+
+    lines_count = len(code_to_test.splitlines())
+    first_line = code_to_test.splitlines()[0][:60]
+    console.print(f"[dim]Тестирую Python-код ({lines_count} строк: '{first_line}')...[/dim]")
+
+    exit_code, log_content = run_interactive_python_test(code_to_test)
+    if exit_code == 0:
+        console.print("[green]✓ Тестирование завершено (код 0). Результат сохранён в диалог.[/green]")
+    else:
+        console.print(f"[yellow]⚠ Тестирование завершилось с кодом {exit_code}. Результат сохранён в диалог.[/yellow]")
+
+    session_snippet = log_content[:6000] if log_content else "Скрипт выполнился без вывода в консоль"
+    messages.append({
+        "role": "user",
+        "content": (
+            f"[Системный отчёт: пользователь запустил /testpy в отдельной консоли для проверки последнего кода]\n"
+            f"Код завершения: {exit_code}\n"
+            f"Лог взаимодействия в консоли:\n```\n{session_snippet}\n```\n"
+            f"(Если в логе ошибка или неверный результат — разбери причину и предложи исправление; если всё прошло успешно — подтверди)."
+        )
+    })
+    messages.append({
+        "role": "assistant",
+        "content": f"Лог тестирования получен (код {exit_code}). Если нужно исправить логику или ошибки ввода — напиши!"
+    })
+    save_current_chat(system_prompt, messages)
+    return messages[-1]["content"]
+
+
+def _handle_undo_cmd(messages, system_prompt):
+    removed = False
+    if messages and messages[-1]["role"] == "assistant":
+        messages.pop()
+        removed = True
+    if messages and messages[-1]["role"] == "user":
+        messages.pop()
+        removed = True
+    last_response = next(
+        (
+            item["content"]
+            for item in reversed(messages)
+            if item["role"] == "assistant"
+        ),
+        "",
+    )
+    console.print(
+        "[green]Последний ход удалён.[/green]"
+        if removed
+        else "[dim]Удалять нечего.[/dim]"
+    )
+    if removed:
+        save_current_chat(system_prompt, messages)
+    return last_response
+
+
+def _handle_pull_cmd(argument, model):
+    models_to_pull = argument.split()
+    if not models_to_pull:
+        downloaded = first_time_setup_wizard()
+        if downloaded:
+            model = downloaded
+            start_background_preload(model)
+            print_header(model)
+    else:
+        GLOBAL_PULL_QUEUE.add(models_to_pull)
+        GLOBAL_PULL_QUEUE.run_all()
+    return model
+
+
+def _run_cli_oneshot(cli_args):
+    from . import config
+    first_arg = cli_args[0].lower()
+    if first_arg in ("-q", "--unload", "/unload", "unload"):
+        unloaded = unload_all_models()
+        msg = ", ".join(unloaded) if unloaded else "нет активных моделей"
+        console.print(f"[green]✓ Все модели выгружены из VRAM ({msg}).[/green]")
+        return
+
+    if first_arg in ("pull", "download", "--pull", "скачать"):
+        models_to_pull = cli_args[1:]
+        if not models_to_pull:
+            first_time_setup_wizard()
+            return
+        GLOBAL_PULL_QUEUE.add(models_to_pull)
+        GLOBAL_PULL_QUEUE.run_all()
+        return
+
+    if first_arg in ("--config", "-c", "config", "/config", "/settings"):
+        interactive_config_menu()
+        return
+
+    models = installed_models()
+    if not models:
+        console.print("[yellow]W1x: первый запуск. Выберите стартовую модель для загрузки:[/yellow]")
+        downloaded = first_time_setup_wizard()
+        if not downloaded:
+            return
+        models = installed_models()
+
+    target_model = get_last_model(models)
+    question_parts = []
+    i = 0
+    while i < len(cli_args):
+        arg = cli_args[i]
+        if arg in ("-m", "--model") and i + 1 < len(cli_args):
+            custom_m = cli_args[i + 1]
+            if custom_m in models:
+                target_model = custom_m
+            i += 2
+        else:
+            question_parts.append(arg)
+            i += 1
+
+    question = " ".join(question_parts).strip() or "Привет!"
+    messages = [
+        {"role": "system", "content": config.DEFAULT_SYSTEM_PROMPT},
+        {"role": "user", "content": question},
+    ]
+    try:
+        wait_for_model_ready(target_model)
+        generate_answer(target_model, messages, think_mode=False)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Прервано пользователем.[/yellow]")
+    except Exception as error:
+        console.print(f"[red]Ошибка: {error}[/red]")
+
+
 def main():
     import sys
-    from . import config
 
     cli_args = sys.argv[1:]
     if cli_args:
-        first_arg = cli_args[0].lower()
-        if first_arg in ("-q", "--unload", "/unload", "unload"):
-            unloaded = unload_all_models()
-            msg = ", ".join(unloaded) if unloaded else "нет активных моделей"
-            console.print(f"[green]✓ Все модели выгружены из VRAM ({msg}).[/green]")
-            return
-
-        if first_arg in ("pull", "download", "--pull", "скачать"):
-            models_to_pull = cli_args[1:]
-            if not models_to_pull:
-                first_time_setup_wizard()
-                return
-            GLOBAL_PULL_QUEUE.add(models_to_pull)
-            GLOBAL_PULL_QUEUE.run_all()
-            return
-
-        if first_arg in ("--config", "-c", "config", "/config", "/settings"):
-            interactive_config_menu()
-            return
-
-        models = installed_models()
-        if not models:
-            console.print("[yellow]W1x: первый запуск. Выберите стартовую модель для загрузки:[/yellow]")
-            downloaded = first_time_setup_wizard()
-            if not downloaded:
-                return
-            models = installed_models()
-
-        target_model = get_last_model(models)
-        question_parts = []
-        i = 0
-        while i < len(cli_args):
-            arg = cli_args[i]
-            if arg in ("-m", "--model") and i + 1 < len(cli_args):
-                custom_m = cli_args[i + 1]
-                if custom_m in models:
-                    target_model = custom_m
-                i += 2
-            else:
-                question_parts.append(arg)
-                i += 1
-
-        question = " ".join(question_parts).strip()
-        if not question:
-            question = "Привет!"
-
-        system_prompt = config.DEFAULT_SYSTEM_PROMPT
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": question},
-        ]
-        try:
-            wait_for_model_ready(target_model)
-            generate_answer(target_model, messages, think_mode=False)
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Прервано пользователем.[/yellow]")
-        except Exception as error:
-            console.print(f"[red]Ошибка: {error}[/red]")
+        _run_cli_oneshot(cli_args)
         return
 
     show_terminal_emoji_hint()
@@ -393,43 +548,36 @@ def main():
             )
             continue
 
-        if command in {"/help", "/?"}:
-            print_help()
-            continue
+        simple_commands = {
+            "/help": print_help,
+            "/?": print_help,
+            "/config": interactive_config_menu,
+            "/settings": interactive_config_menu,
+            "/настройки": interactive_config_menu,
+            "/unload": lambda: reset_all_models(show_message=True),
+            "/free": lambda: reset_all_models(show_message=True),
+            "/models": lambda: print_models(installed_models()),
+            "/tools": _print_tools_panel,
+            "/workspace": lambda: _handle_workspace_cmd(argument),
+            "/memory": lambda: _handle_memory_cmd(messages),
+            "/status": lambda: print_status(model, think_mode, stats_enabled, messages),
+        }
 
-        if command in {"/config", "/settings", "/настройки"}:
-            interactive_config_menu()
-            continue
-
-        if command in {"/unload", "/free"}:
-            reset_all_models(show_message=True)
-            continue
-
-        if command == "/models":
-            print_models(installed_models())
+        if command in simple_commands:
+            simple_commands[command]()
             continue
 
         if command in {"/pull", "/download", "/скачать"}:
-            models_to_pull = argument.split()
-            if not models_to_pull:
-                downloaded = first_time_setup_wizard()
-                if downloaded:
-                    model = downloaded
-                    start_background_preload(model)
-                    print_header(model)
-            else:
-                GLOBAL_PULL_QUEUE.add(models_to_pull)
-                GLOBAL_PULL_QUEUE.run_all()
+            model = _handle_pull_cmd(argument, model)
             continue
 
         if command == "/model":
             selected = choose_model(current=model)
-            if selected is None or selected == model:
-                continue
-            reset_all_models()
-            model = selected
-            start_background_preload(model)
-            print_header(model)
+            if selected is not None and selected != model:
+                reset_all_models()
+                model = selected
+                start_background_preload(model)
+                print_header(model)
             continue
 
         if command in {"/new", "/clear"}:
@@ -455,44 +603,6 @@ def main():
                 print_stats(last_stats, totals)
             continue
 
-        if command == "/tools":
-            console.print(
-                Panel(
-                    "[bold]search_web[/bold] — поиск свежей информации\n"
-                    "[bold]calculate_datetime[/bold] — дата, время и точные смещения\n"
-                    "[bold]calculate_expression[/bold] — точная арифметика\n"
-                    "[bold]run_python_code[/bold] — проверка Python, только после подтверждения\n"
-                    "[bold]remember/recall/forget[/bold] — постоянная память фактов\n"
-                    "[bold]list/read_project[/bold] — безопасное чтение выбранной папки\n"
-                    "[bold]ask_antigravity[/bold] — старшая модель для сложных задач\n\n"
-                    "[dim]Просто сформулируй задачу: модель сама выберет инструмент.[/dim]",
-                    title="Инструменты",
-                    border_style="magenta",
-                )
-            )
-            continue
-
-        if command == "/workspace":
-            if not argument:
-                console.print(
-                    f"[dim]Текущая папка: {config.ACTIVE_FILE_ROOT or 'не выбрана'}[/dim]\n"
-                    "Используй: [cyan]/workspace C:\\путь\\к\\проекту[/cyan] "
-                    "или [cyan]/workspace off[/cyan]"
-                )
-                continue
-            if argument.casefold() in {"off", "none", "выкл"}:
-                config.ACTIVE_FILE_ROOT = None
-                console.print("[green]Доступ к папке проекта отключён.[/green]")
-                continue
-            try:
-                selected_root = set_file_workspace(argument.strip('"'))
-                console.print(
-                    f"[green]Папка проекта выбрана только для чтения:[/green] {selected_root}"
-                )
-            except Exception as error:
-                console.print(f"[red]Не удалось выбрать папку: {error}[/red]")
-            continue
-
         if command == "/agy":
             if not argument:
                 console.print("[dim]Используй: /agy задача для старшей модели[/dim]")
@@ -514,46 +624,7 @@ def main():
             continue
 
         if command == "/think":
-            value = argument.lower()
-            if not value:
-                think_mode = False if think_mode else True
-            elif value in {"off", "false", "0"}:
-                think_mode = False
-            elif value in {"on", "true", "1"}:
-                think_mode = True
-            elif value in {"low", "medium", "high"}:
-                think_mode = value
-            else:
-                console.print("[red]Используй: /think off|on|low|medium|high[/red]")
-                continue
-            label = "выключен" if not think_mode else str(think_mode)
-            console.print(f"[green]Thinking: {label}.[/green]")
-            continue
-
-        if command == "/status":
-            print_status(model, think_mode, stats_enabled, messages)
-            continue
-
-        if command == "/memory":
-            turns = sum(item["role"] == "user" for item in messages)
-            facts = load_facts()
-            fact_preview = "\n".join(
-                f"• {item['fact']}" for item in facts[-10:]
-            ) or "Постоянных фактов пока нет."
-            console.print(
-                Panel(
-                    f"Сохранено сообщений пользователя: [bold]{turns}[/bold]\n"
-                    f"Лимит истории: [bold]{MAX_SAVED_MESSAGES} сообщений[/bold]\n"
-                    f"Постоянных фактов: [bold]{len(facts)}[/bold]\n"
-                    f"Файл диалога: {CURRENT_CHAT_PATH}\n"
-                    f"Файл фактов: {FACTS_PATH}\n\n"
-                    f"{fact_preview}\n\n"
-                    "[dim]/new очищает диалог, но не постоянные факты; "
-                    "/forget текст удаляет факт[/dim]",
-                    title="Постоянная память",
-                    border_style="cyan",
-                )
-            )
+            think_mode = _handle_think_cmd(argument, think_mode)
             continue
 
         if command == "/forget":
@@ -584,38 +655,7 @@ def main():
             continue
 
         if command == "/testpy":
-            code_to_test = argument or extract_latest_python_code(messages)
-            if not code_to_test:
-                console.print("[yellow]В диалоге не найдено исполняемого Python-кода для тестирования.[/yellow]")
-                console.print("[dim]Подсказка: вы можете передать код напрямую: /testpy print('hello')[/dim]")
-                continue
-
-            lines_count = len(code_to_test.splitlines())
-            first_line = code_to_test.splitlines()[0][:60]
-            console.print(f"[dim]Тестирую Python-код ({lines_count} строк: '{first_line}')...[/dim]")
-
-            exit_code, log_content = run_interactive_python_test(code_to_test)
-            if exit_code == 0:
-                console.print("[green]✓ Тестирование завершено (код 0). Результат сохранён в диалог.[/green]")
-            else:
-                console.print(f"[yellow]⚠ Тестирование завершилось с кодом {exit_code}. Результат сохранён в диалог.[/yellow]")
-
-            session_snippet = log_content[:6000] if log_content else "Скрипт выполнился без вывода в консоль"
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"[Системный отчёт: пользователь запустил /testpy в отдельной консоли для проверки последнего кода]\n"
-                    f"Код завершения: {exit_code}\n"
-                    f"Лог взаимодействия в консоли:\n```\n{session_snippet}\n```\n"
-                    f"(Если в логе ошибка или неверный результат — разбери причину и предложи исправление; если всё прошло успешно — подтверди)."
-                )
-            })
-            messages.append({
-                "role": "assistant",
-                "content": f"Лог тестирования получен (код {exit_code}). Если нужно исправить логику или ошибки ввода — напиши!"
-            })
-            save_current_chat(system_prompt, messages)
-            last_response = messages[-1]["content"]
+            last_response = _handle_testpy_cmd(argument, messages, system_prompt, last_response)
             continue
 
         if command == "/save":
@@ -627,28 +667,7 @@ def main():
             continue
 
         if command == "/undo":
-            removed = False
-            if messages and messages[-1]["role"] == "assistant":
-                messages.pop()
-                removed = True
-            if messages and messages[-1]["role"] == "user":
-                messages.pop()
-                removed = True
-            last_response = next(
-                (
-                    item["content"]
-                    for item in reversed(messages)
-                    if item["role"] == "assistant"
-                ),
-                "",
-            )
-            console.print(
-                "[green]Последний ход удалён.[/green]"
-                if removed
-                else "[dim]Удалять нечего.[/dim]"
-            )
-            if removed:
-                save_current_chat(system_prompt, messages)
+            last_response = _handle_undo_cmd(messages, system_prompt)
             continue
 
         fact_to_remember = extract_remember_request(prompt)
@@ -735,7 +754,7 @@ def main():
             continue
 
         if interrupted:
-            ACTIVE_SESSION_DATA["cancelled_prompt"] = user_input
+            ACTIVE_SESSION_DATA["cancelled_prompt"] = prompt
             if messages and messages[-1].get("role") == "user":
                 messages.pop()
                 save_current_chat(system_prompt, messages)
