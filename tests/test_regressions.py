@@ -2,7 +2,7 @@
 Regression and resilience test suite for w1x-cli.
 Covers:
 - Preload task isolation and error reset under concurrency
-- Worker queue termination atomicity
+- Worker shutdown on an empty queue
 - Memory facts sandbox and corrupted file recovery
 - Chat session recovery from invalid payloads
 - Arithmetic parsing without misinterpreting dates or phone numbers
@@ -69,7 +69,7 @@ def test_preload_task_isolation():
         b_finished.set()
 
 
-def test_puller_worker_termination_atomicity():
+def test_worker_exits_and_clears_reference_on_empty_queue():
     """Verify worker terminates safely when queue is empty."""
     mgr = AsyncPullManager()
     t = threading.Thread(target=mgr._worker_loop, daemon=True)
@@ -134,12 +134,21 @@ def test_memory_sandbox_redirection(tmp_path, monkeypatch):
     assert len(memory.load_facts()) == 1
 
 
-def test_tools_datetime_offset_safe_types():
-    """Verify datetime offset parameters accept flexible string floats and None safely."""
-    res_str = calculate_datetime(days="1.5", hours=None, minutes="0", seconds=10)
+def test_datetime_normalizes_string_and_none_offsets():
+    """Fractional strings follow the integer offset contract; None becomes zero."""
+    res_str = calculate_datetime(
+        days="1.5", hours=None, minutes="0", seconds=10,
+        base_datetime="2026-01-01T12:00:00+03:00",
+    )
     data = json.loads(res_str)
-    assert "answer" in data or "datetime" in data or "error" not in data
+    assert "error" not in data
+    assert data["current"] == "2026-01-01T12:00:00+03:00"
+    assert data["result"] == "2026-01-02T12:00:10+03:00"
+    assert data["offset"] == {"days": 1, "hours": 0, "minutes": 0, "seconds": 10}
+    assert data["answer"]
 
+
+def test_datetime_rejects_invalid_offset():
     res_err = calculate_datetime(days="invalid_days")
     data_err = json.loads(res_err)
     assert "error" in data_err
@@ -157,42 +166,81 @@ def test_app_load_current_chat_corrupted_list(tmp_path, monkeypatch):
     assert messages[0]["role"] == "system"
 
 
-def test_engine_dates_and_phones_not_computed_as_math():
-    """Verify dates and phone numbers are excluded from automated arithmetic precomputation."""
+def test_model_prompt_precomputes_math_without_dates_or_phone_numbers(monkeypatch):
+    """Exercise arithmetic precomputation inside the real model prompt path."""
+    import w1x.engine as engine
+
     text = "События 2026-11-08 и звонок на номер +7-999-123-45-67, но посчитай 25 * 4"
-    math_candidates = re.findall(r"[\d\s().,+\-*/%]{3,}", text.replace("×", "*").replace("÷", "/"))
-    precomputed = []
-    for cand in math_candidates:
-        cand_clean = cand.strip(" ,.")
-        if re.search(r"\b\d{4}-\d{2}-\d{2}\b", cand_clean) or re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", cand_clean):
-            continue
-        if re.search(r"^\+?\d[\d\s-]{7,}\d$", cand_clean):
-            continue
-        if re.search(r"[+\-*/%]", cand_clean) and re.search(r"\d", cand_clean) and len(cand_clean) >= 3:
-            val = calculate_expression(cand_clean)
-            if not val.startswith("Ошибка"):
-                precomputed.append(f"{cand_clean} = {val}")
+    # Bypass direct tool routing to exercise precomputation in the model prompt.
+    monkeypatch.setattr(engine, "parse_math_request", lambda _: None)
+    monkeypatch.setattr(engine, "split_datetime_request", lambda _: (None, text))
+    monkeypatch.setattr(engine, "relevant_memory_block", lambda _: "")
+    monkeypatch.setattr(engine, "get_keep_alive", lambda: "0")
+    monkeypatch.setattr(engine, "get_context_tokens", lambda: 8192)
+    chat = MagicMock(return_value=iter([]))
+    calculator = MagicMock(wraps=calculate_expression)
+    monkeypatch.setattr(engine, "chat", chat)
+    monkeypatch.setattr(engine, "calculate_expression", calculator)
 
-    assert not any("2026-11-08" in item for item in precomputed)
-    assert not any("999-123" in item for item in precomputed)
-    assert any("25 * 4 = 100" in item for item in precomputed)
+    engine.generate_answer("offline-model", [
+        {"role": "system", "content": "Test assistant"},
+        {"role": "user", "content": text},
+    ], False)
+
+    calculator.assert_called_once_with("25 * 4")
+    chat.assert_called_once()
+    prompt = chat.call_args.kwargs["messages"][0]["content"]
+    math_block = prompt.split("Точные математические вычисления системы:\n", 1)[1]
+    assert "- 25 * 4 = 100" in math_block
+    assert "2026-11-08" not in math_block
+    assert "999-123" not in math_block
 
 
-def test_config_atomic_save(tmp_path, monkeypatch):
-    """Verify user configuration is saved atomically via temporary replacement."""
+def test_config_save_replaces_complete_temporary_file(tmp_path, monkeypatch):
     cfg_file = tmp_path / "config.json"
     monkeypatch.setattr(w1x_config, "CONFIG_FILE_PATH", cfg_file)
+    cfg_file.write_text('{"old": true}', encoding="utf-8")
+    replace = Path.replace
+    replacements = []
+
+    def observe_replace(source, destination):
+        assert source == cfg_file.with_suffix(".tmp")
+        assert destination == cfg_file
+        assert json.loads(cfg_file.read_text(encoding="utf-8")) == {"old": True}
+        assert json.loads(source.read_text(encoding="utf-8")) == {"test_key": "test_val"}
+        replacements.append(source)
+        return replace(source, destination)
+
+    monkeypatch.setattr(Path, "replace", observe_replace)
 
     save_user_config({"test_key": "test_val"})
     assert cfg_file.exists()
     saved = json.loads(cfg_file.read_text(encoding="utf-8"))
     assert saved.get("test_key") == "test_val"
+    assert replacements == [cfg_file.with_suffix(".tmp")]
+    assert not replacements[0].exists()
 
 
-def test_reset_all_models_accepts_show_message():
-    """Verify reset_all_models accepts show_message parameter without crash."""
+def test_config_save_preserves_previous_file_when_replacement_fails(tmp_path, monkeypatch):
+    cfg_file = tmp_path / "config.json"
+    original = '{"old": true}\n'
+    cfg_file.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(w1x_config, "CONFIG_FILE_PATH", cfg_file)
+    replace = MagicMock(side_effect=OSError("replacement denied"))
+    monkeypatch.setattr(Path, "replace", replace)
+
+    save_user_config({"new": True})
+
+    replace.assert_called_once_with(cfg_file)
+    assert cfg_file.read_text(encoding="utf-8") == original
+
+
+def test_reset_all_models_delegates_without_forwarding_display_option(monkeypatch):
+    unload = MagicMock(return_value=["test-model"])
+    monkeypatch.setattr(models, "unload_all_models", unload)
     res = models.reset_all_models(show_message=True)
-    assert isinstance(res, (list, bool, type(None)))
+    assert res == ["test-model"]
+    unload.assert_called_once_with()
 
 
 def test_set_file_workspace_syncs_globals(tmp_path):
@@ -207,11 +255,62 @@ def test_set_file_workspace_syncs_globals(tmp_path):
         tools.ACTIVE_FILE_ROOT = orig
 
 
-def test_testpy_runner_code_templates():
-    """Verify interactive test runner template handles dynamic streams and error codes."""
-    import inspect
+@pytest.mark.parametrize("exit_value, expected_code", [(None, 0), (7, 7), ("failure", 1)])
+def test_python_runner_forwards_stream_attributes_and_exit_codes(tmp_path, monkeypatch, exit_value, expected_code):
+    """Execute the generated runner through pipes, without opening a terminal window."""
+    import subprocess
     from w1x import testpy
-    source = inspect.getsource(testpy.run_interactive_python_test)
-    assert "__getattr__" in source
-    assert "getattr(self.original, name)" in source
-    assert "exit_code = exc.code if isinstance(exc.code, int) else (1 if exc.code is not None else 0)" in source
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    monkeypatch.setattr(testpy.tempfile, "mkdtemp", lambda **_: str(session_dir))
+    run = subprocess.run
+    child_results = []
+
+    def run_without_window(arguments, **_):
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        result = run(arguments, input="q\n", capture_output=True, text=True,
+                     encoding="utf-8", env=env, timeout=10)
+        child_results.append(result)
+        return result
+
+    monkeypatch.setattr(testpy.subprocess, "run", run_without_window)
+    code = (
+        "import sys\n"
+        "print('stream-encoding=' + sys.stdout.encoding)\n"
+        "print('stream-fd=' + str(sys.stdout.fileno()))\n"
+        f"raise SystemExit({exit_value!r})\n"
+    )
+    exit_code, log = testpy.run_interactive_python_test(code)
+
+    assert len(child_results) == 1
+    assert child_results[0].returncode == 0
+    assert exit_code == expected_code
+    assert "stream-encoding=utf-8" in log
+    assert "stream-fd=" in log
+    assert "Traceback" not in log
+    assert not session_dir.exists()
+
+
+def test_app_imports_load_user_config():
+    from w1x import app
+    assert callable(getattr(app, "load_user_config", None))
+
+
+def test_weak_tool_answer_escalate():
+    from w1x.engine import weak_tool_answer
+    assert weak_tool_answer("ESCALATE") is True
+    assert weak_tool_answer("Пожалуйста, escalate") is True
+
+
+def test_calculate_datetime_overflow_safety():
+    from w1x.tools import calculate_datetime
+    res = json.loads(calculate_datetime(days="999999999999"))
+    assert "error" in res
+
+
+def test_testpy_null_byte_safety():
+    from w1x.testpy import is_valid_python
+    assert is_valid_python("print('hello')\x00extra") is False
+

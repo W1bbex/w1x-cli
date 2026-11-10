@@ -73,7 +73,7 @@ def trim_messages_for_model(messages):
 
 def weak_tool_answer(text):
     normalized = " ".join(text.lower().split())
-    if not normalized:
+    if not normalized or "escalate" in normalized:
         return True
     return bool(
         re.search(

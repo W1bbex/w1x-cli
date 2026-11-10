@@ -57,28 +57,31 @@ def search_web(query: str) -> str:
     regions = ["ru-ru", "us-en"] if has_cyrillic else ["us-en", "ru-ru"]
     results = []
     seen_urls = set()
-    search = DDGS(timeout=12)
-    for region in regions:
-        try:
-            region_results = list(
-                search.text(
-                    query,
-                    region=region,
-                    safesearch="off",
-                    max_results=5,
-                )
-            )
-        except Exception:
-            continue
-        for item in region_results:
-            url = str(item.get("href") or item.get("url") or "").strip()
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                results.append(item)
-            if len(results) >= 3:
-                break
-        if len(results) >= 3:
-            break
+    try:
+        with DDGS(timeout=12) as search:
+            for region in regions:
+                try:
+                    region_results = list(
+                        search.text(
+                            query,
+                            region=region,
+                            safesearch="off",
+                            max_results=5,
+                        )
+                    )
+                except Exception:
+                    continue
+                for item in region_results:
+                    url = str(item.get("href") or item.get("url") or "").strip()
+                    if url and url not in seen_urls:
+                        seen_urls.add(url)
+                        results.append(item)
+                    if len(results) >= 3:
+                        break
+                if len(results) >= 3:
+                    break
+    except Exception:
+        pass
     if not results:
         return "Поиск не вернул результатов."
 
@@ -220,7 +223,10 @@ def calculate_datetime(
         minutes=minutes,
         seconds=seconds,
     )
-    result = now + delta
+    try:
+        result = now + delta
+    except OverflowError:
+        return json.dumps({"error": "Смещение даты слишком велико."}, ensure_ascii=False)
     offset = now.strftime("%z")
     offset = f"{offset[:3]}:{offset[3:]}" if len(offset) == 5 else offset
 
@@ -697,9 +703,9 @@ def read_project_file(relative_path: str) -> str:
         return f"Ошибка доступа: {error}"
     if not path.exists() or not path.is_file():
         return "Ошибка: файл не существует."
-    if path.stat().st_size > 2_000_000:
-        return "Ошибка: файл больше 2 МБ и не будет прочитан."
     try:
+        if path.stat().st_size > 2_000_000:
+            return "Ошибка: файл больше 2 МБ и не будет прочитан."
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as error:
         return f"Ошибка чтения: {error}"
@@ -773,7 +779,7 @@ def ask_antigravity(task: str, context: str = "") -> str:
 
     process = None
     allowed_env_names = {
-        "APPDATA", "COMSPEC", "LANG", "LC_ALL", "LOCALAPPDATA", "PATH",
+        "APPDATA", "COMSPEC", "HOME", "LANG", "LC_ALL", "LOCALAPPDATA", "PATH",
         "PATHEXT", "PROGRAMFILES", "PROGRAMFILES(X86)", "SYSTEMDRIVE",
         "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE", "WINDIR",
     }
