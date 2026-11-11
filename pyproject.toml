@@ -42,5 +42,4 @@ Homepage = "https://github.com/w1bbex/w1x-cli"
 Issues = "https://github.com/w1bbex/w1x-cli/issues"
 
 [tool.pytest.ini_options]
-addopts = "--basetemp=.pytest_temp"
 pythonpath = ["."]

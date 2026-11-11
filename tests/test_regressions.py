@@ -343,3 +343,41 @@ def test_save_user_config_returns_boolean_and_handles_error(tmp_path, monkeypatc
     monkeypatch.setattr(Path, "replace", MagicMock(side_effect=OSError("write denied")))
     assert w1x_config.save_user_config({"test_status": "fail"}) is False
 
+
+def test_floor_division_and_modulo_preserve_python_operator_semantics():
+    from w1x.tools import calculate_expression
+
+    observed = (calculate_expression("-5 // 2"), calculate_expression("-5 % 2"))
+    assert observed == ("-3", "1")
+
+
+def test_decimal_literal_is_not_rounded_through_binary_float():
+    from w1x.tools import calculate_expression
+
+    assert calculate_expression("9007199254740993.0 - 9007199254740992.0") == "1"
+
+
+def test_numeric_base_date_is_used_instead_of_today():
+    import json
+    from datetime import datetime
+    from w1x.tools import calculate_datetime, parse_datetime_request
+
+    arguments = parse_datetime_request("если сейчас 01.01.2025 10:00, через 2 часа")
+    assert arguments is not None
+    result = datetime.fromisoformat(json.loads(calculate_datetime(**arguments))["result"])
+    assert result.replace(tzinfo=None) == datetime(2025, 1, 1, 12)
+
+
+def test_time_components_keep_their_individual_directions():
+    import json
+    from datetime import datetime
+    from w1x.tools import calculate_datetime, parse_datetime_request
+
+    arguments = parse_datetime_request(
+        "если сейчас 1 января 2025 12:00 прибавь 1 час и вычти 30 минут"
+    )
+    assert arguments is not None
+    result = datetime.fromisoformat(json.loads(calculate_datetime(**arguments))["result"])
+    assert result.replace(tzinfo=None) == datetime(2025, 1, 1, 12, 30)
+
+
