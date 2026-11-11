@@ -1,6 +1,9 @@
 import json
+import logging
 import threading
 from pathlib import Path
+
+logger = logging.getLogger("w1x")
 
 APP_VERSION = "3.5.1"
 EXIT_COMMANDS = {"q", "/q", "quit", "/quit", "exit", "/exit"}
@@ -42,21 +45,29 @@ def load_user_config():
             cfg = dict(DEFAULT_CONFIG)
             cfg.update(data)
             return cfg
-    except Exception:
-        pass
+        logger.warning("Corrupted config file %s (expected JSON object); using defaults", CONFIG_FILE_PATH)
+    except Exception as exc:
+        logger.warning("Failed to load config file %s: %s; using defaults", CONFIG_FILE_PATH, exc)
     return dict(DEFAULT_CONFIG)
 
 
-def save_user_config(cfg):
+def save_user_config(cfg) -> bool:
+    tmp_path = CONFIG_FILE_PATH.with_suffix(".tmp")
     try:
-        tmp_path = CONFIG_FILE_PATH.with_suffix(".tmp")
         tmp_path.write_text(
             json.dumps(cfg, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         tmp_path.replace(CONFIG_FILE_PATH)
-    except Exception:
-        pass
+        return True
+    except Exception as exc:
+        logger.warning("Failed to save config file %s: %s", CONFIG_FILE_PATH, exc)
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        return False
 
 
 def get_keep_alive():

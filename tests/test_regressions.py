@@ -314,3 +314,32 @@ def test_testpy_null_byte_safety():
     from w1x.testpy import is_valid_python
     assert is_valid_python("print('hello')\x00extra") is False
 
+
+def test_terminal_runner_captures_subprocess_crash_returncode(tmp_path, monkeypatch):
+    import subprocess
+    from w1x import testpy
+
+    session_dir = tmp_path / "crash_session"
+    session_dir.mkdir()
+    monkeypatch.setattr(testpy.tempfile, "mkdtemp", lambda **_: str(session_dir))
+
+    fake_proc = subprocess.CompletedProcess(args=["python", "runner.py"], returncode=42)
+    monkeypatch.setattr(testpy.subprocess, "run", lambda *args, **kwargs: fake_proc)
+
+    exit_code, log = testpy.run_interactive_python_test("print('crash')")
+    assert exit_code == 42
+
+
+def test_save_user_config_returns_boolean_and_handles_error(tmp_path, monkeypatch):
+    from w1x import config as w1x_config
+    cfg_file = tmp_path / "config.json"
+    monkeypatch.setattr(w1x_config, "CONFIG_FILE_PATH", cfg_file)
+
+    # Success case returns True
+    assert w1x_config.save_user_config({"test_status": "ok"}) is True
+    assert cfg_file.exists()
+
+    # Failure case returns False honestly
+    monkeypatch.setattr(Path, "replace", MagicMock(side_effect=OSError("write denied")))
+    assert w1x_config.save_user_config({"test_status": "fail"}) is False
+
