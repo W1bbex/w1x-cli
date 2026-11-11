@@ -57,6 +57,7 @@ def search_web(query: str) -> str:
     regions = ["ru-ru", "us-en"] if has_cyrillic else ["us-en", "ru-ru"]
     results = []
     seen_urls = set()
+    last_error = None
     try:
         with DDGS(timeout=12) as search:
             for region in regions:
@@ -69,7 +70,8 @@ def search_web(query: str) -> str:
                             max_results=5,
                         )
                     )
-                except Exception:
+                except Exception as exc:
+                    last_error = exc
                     continue
                 for item in region_results:
                     url = str(item.get("href") or item.get("url") or "").strip()
@@ -80,9 +82,11 @@ def search_web(query: str) -> str:
                         break
                 if len(results) >= 3:
                     break
-    except Exception:
-        pass
+    except Exception as exc:
+        last_error = exc
     if not results:
+        if last_error is not None:
+            return f"Ошибка поиска: {type(last_error).__name__}: {last_error}"
         return "Поиск не вернул результатов."
 
     # Выводим красивое дерево найденных сайтов и сниппетов в консоль пользователя
@@ -283,14 +287,37 @@ def _extract_base_datetime(text):
         rf"\b([0-3]?\d)\s+({month_pattern})(?:\s+(20\d{{2}}))?\b",
         normalized,
     )
-    if not time_match and not date_match:
+    numeric_date_match = re.search(
+        r"\b([0-3]?\d)[./]([01]?\d)[./](20\d{2}|\d{2})\b",
+        normalized,
+    )
+    iso_date_match = re.search(
+        r"\b(20\d{2})-([01]\d)-([0-3]\d)\b",
+        normalized,
+    )
+    has_any_date = bool(date_match or numeric_date_match or iso_date_match)
+    if not time_match and not has_any_date:
         return ""
-    if not date_match and not re.search(r"\b(?:если\s+)?сейчас\b", normalized):
+    if not has_any_date and not re.search(r"\b(?:если\s+)?сейчас\b", normalized):
         return ""
     current = datetime.now().astimezone().replace(microsecond=0)
-    day = int(date_match.group(1)) if date_match else current.day
-    month = _MONTH_NUMBER_RU[date_match.group(2)] if date_match else current.month
-    year = int(date_match.group(3)) if date_match and date_match.group(3) else current.year
+    if date_match:
+        day = int(date_match.group(1))
+        month = _MONTH_NUMBER_RU[date_match.group(2)]
+        year = int(date_match.group(3)) if date_match.group(3) else current.year
+    elif numeric_date_match:
+        day = int(numeric_date_match.group(1))
+        month = int(numeric_date_match.group(2))
+        raw_year = int(numeric_date_match.group(3))
+        year = raw_year + 2000 if raw_year < 100 else raw_year
+    elif iso_date_match:
+        year = int(iso_date_match.group(1))
+        month = int(iso_date_match.group(2))
+        day = int(iso_date_match.group(3))
+    else:
+        day = current.day
+        month = current.month
+        year = current.year
     hour = int(time_match.group(1)) if time_match else 0
     minute = int(time_match.group(2)) if time_match else 0
     second = int(time_match.group(3) or 0) if time_match else 0
@@ -329,17 +356,40 @@ def parse_datetime_request(text, require_pure=True):
         return None
 
     matches = list(_TIME_VALUE_RE.finditer(normalized))
-    forward = bool(re.search(r"\b(вперед|через|прибав|добав|плюс)\w*", normalized))
-    backward = bool(re.search(r"\b(назад|отмот|вычт|минус)\w*", normalized))
+    forward_re = re.compile(r"\b(вперед|через|прибав|добав|плюс)\w*")
+    backward_re = re.compile(r"\b(назад|отмот|вычт|минус)\w*")
+    forward = bool(forward_re.search(normalized))
+    backward = bool(backward_re.search(normalized))
 
     if matches and (forward or backward or any(
         match.group("value").startswith(("+", "-")) for match in matches
     )):
-        direction = 1 if forward else -1 if backward else 1
+        default_direction = 1 if forward else -1 if backward else 1
         values = {"days": 0, "hours": 0, "minutes": 0, "seconds": 0}
         for match in matches:
-            raw_value = int(match.group("value"))
-            value = abs(raw_value) * direction if (forward or backward) else raw_value
+            raw_str = match.group("value")
+            raw_value = int(raw_str)
+            if raw_str.startswith(("+", "-")):
+                value = raw_value
+            else:
+                prefix = normalized[:match.start()]
+                fwd_before = list(forward_re.finditer(prefix))
+                bwd_before = list(backward_re.finditer(prefix))
+                if fwd_before or bwd_before:
+                    last_fwd = fwd_before[-1].start() if fwd_before else -1
+                    last_bwd = bwd_before[-1].start() if bwd_before else -1
+                    comp_dir = 1 if last_fwd > last_bwd else -1
+                else:
+                    suffix = normalized[match.end():]
+                    fwd_after = forward_re.search(suffix)
+                    bwd_after = backward_re.search(suffix)
+                    if fwd_after and (not bwd_after or fwd_after.start() < bwd_after.start()):
+                        comp_dir = 1
+                    elif bwd_after:
+                        comp_dir = -1
+                    else:
+                        comp_dir = default_direction
+                value = abs(raw_value) * comp_dir
             unit = match.group("unit")
             if unit.startswith("д"):
                 values["days"] += value
@@ -438,28 +488,47 @@ def datetime_answer(arguments):
     return payload.get("answer") or payload.get("error") or raw_result
 
 
+def _decimal_floordiv(a: Decimal, b: Decimal) -> Decimal:
+    q = a // b
+    r = a % b
+    if r != 0 and ((a < 0) != (b < 0)):
+        q -= 1
+    return q
+
+
+def _decimal_mod(a: Decimal, b: Decimal) -> Decimal:
+    r = a % b
+    if r != 0 and ((a < 0) != (b < 0)):
+        r += b
+    return r
+
+
 _BINARY_OPERATORS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
     ast.Mult: operator.mul,
     ast.Div: operator.truediv,
-    ast.FloorDiv: operator.floordiv,
-    ast.Mod: operator.mod,
+    ast.FloorDiv: _decimal_floordiv,
+    ast.Mod: _decimal_mod,
     ast.Pow: operator.pow,
 }
 _UNARY_OPERATORS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
 
 
-def _evaluate_math_node(node):
+def _evaluate_math_node(node, source: str = ""):
     if isinstance(node, ast.Expression):
-        return _evaluate_math_node(node.body)
+        return _evaluate_math_node(node.body, source)
     if isinstance(node, ast.Constant) and type(node.value) in {int, float}:
+        if source:
+            segment = ast.get_source_segment(source, node)
+            if segment:
+                return Decimal(segment.strip().replace("_", ""))
         return Decimal(str(node.value))
     if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPERATORS:
-        return _UNARY_OPERATORS[type(node.op)](_evaluate_math_node(node.operand))
+        return _UNARY_OPERATORS[type(node.op)](_evaluate_math_node(node.operand, source))
     if isinstance(node, ast.BinOp) and type(node.op) in _BINARY_OPERATORS:
-        left = _evaluate_math_node(node.left)
-        right = _evaluate_math_node(node.right)
+        left = _evaluate_math_node(node.left, source)
+        right = _evaluate_math_node(node.right, source)
         if isinstance(node.op, ast.Pow):
             if abs(right) > 1000:
                 raise ValueError("Слишком большая степень")
@@ -499,7 +568,7 @@ def calculate_expression(expression: str) -> str:
         return "Ошибка: выражение пустое или слишком длинное."
     try:
         tree = ast.parse(expression, mode="eval")
-        result = _evaluate_math_node(tree)
+        result = _evaluate_math_node(tree, expression)
         return _format_math_result(result)
     except Exception as error:
         return f"Ошибка вычисления: {type(error).__name__}: {error}"
