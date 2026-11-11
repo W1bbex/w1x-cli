@@ -303,7 +303,7 @@ if __name__ == "__main__":
     exit_code = 0
     log_content = ""
     try:
-        subprocess.run(
+        proc = subprocess.run(
             [sys.executable, str(runner_file)],
             creationflags=creation_flags,
             check=False,
@@ -313,7 +313,9 @@ if __name__ == "__main__":
             try:
                 exit_code = int(exit_code_file.read_text(encoding="utf-8").strip())
             except Exception:
-                exit_code = 0
+                exit_code = proc.returncode if proc.returncode != 0 else 1
+        else:
+            exit_code = proc.returncode if proc.returncode != 0 else 1
 
         if log_file.exists():
             try:
