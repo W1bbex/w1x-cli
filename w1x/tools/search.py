@@ -1,10 +1,7 @@
 """Инструмент веб-поиска DuckDuckGo."""
 from urllib.parse import urlparse
 
-try:
-    from duckduckgo_search import DDGS
-except ImportError:
-    from ddgs import DDGS  # type: ignore[assignment]
+from duckduckgo_search import DDGS
 from rich.tree import Tree
 
 from ..terminal import console
