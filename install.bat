@@ -19,9 +19,19 @@ python -m pip install --upgrade pip
 
 echo [2/3] Установка зависимостей (rich, prompt_toolkit, ollama, duckduckgo)...
 python -m pip install -r "%~dp0requirements.txt"
+if %errorlevel% neq 0 (
+    echo [ОШИБКА] Не удалось установить зависимости!
+    pause
+    exit /b 1
+)
 
 echo [3/3] Установка пакета в систему...
 python -m pip install -e "%~dp0."
+if %errorlevel% neq 0 (
+    echo [ОШИБКА] Не удалось установить пакет w1x-cli!
+    pause
+    exit /b 1
+)
 
 echo.
 echo ===================================================

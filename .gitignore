@@ -61,3 +61,5 @@ Desktop.ini
 
 .pytest_temp/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/

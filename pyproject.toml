@@ -30,9 +30,18 @@ dependencies = [
     "ollama>=0.4.0",
     "rich>=13.7.0",
     "prompt_toolkit>=3.0.43",
-    "requests>=2.31.0",
     "duckduckgo_search>=7.0.0",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "mypy>=1.10",
+    "ruff>=0.6.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["w1x*"]
 
 [project.scripts]
 w1x = "w1x.app:main"
@@ -43,3 +52,22 @@ Issues = "https://github.com/w1bbex/w1x-cli/issues"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+ignore_missing_imports = true
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I", "UP"]
+ignore = ["E501"]

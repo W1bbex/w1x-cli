@@ -1,3 +1,7 @@
 @echo off
 chcp 65001 >nul
-python "%~dp0main.py" %*
+if exist "%~dp0.venv\Scripts\python.exe" (
+    "%~dp0.venv\Scripts\python.exe" "%~dp0main.py" %*
+) else (
+    python "%~dp0main.py" %*
+)

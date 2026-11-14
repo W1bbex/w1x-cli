@@ -31,11 +31,17 @@
    git clone https://github.com/w1bbex/w1x-cli.git
    cd w1x-cli
    ```
-2. Установите в режиме разработки:
+2. Установите зависимости для разработки и проверки качества:
    ```bash
-   pip install -e .
+   pip install -e ".[dev]"
    ```
-3. Запустите:
+3. Перед отправкой PR проверьте код:
+   ```bash
+   ruff check w1x tests scripts main.py
+   mypy w1x
+   pytest -q
+   ```
+4. Запустите CLI:
    ```bash
    w1x
    # или напрямую
