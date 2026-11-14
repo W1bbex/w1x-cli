@@ -10,7 +10,8 @@ from w1x import app, config, models
 def test_first_run_simulator_is_import_safe_and_restores_state(monkeypatch, app_fails):
     names = ("DATA_DIR", "CHAT_DIR", "CURRENT_CHAT_PATH", "FACTS_PATH", "CONFIG_FILE_PATH")
     previous_paths = {name: getattr(config, name) for name in names}
-    installed = lambda: ["existing-model"]
+    def installed():
+        return ["existing-model"]
     monkeypatch.setattr(models, "installed_models", installed)
     script = Path(__file__).resolve().parents[1] / "scripts" / "simulate_first_run.py"
 

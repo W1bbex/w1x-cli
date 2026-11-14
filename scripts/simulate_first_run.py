@@ -9,6 +9,7 @@ def main():
     if str(app_dir) not in sys.path:
         sys.path.insert(0, str(app_dir))
 
+    import w1x.app as app_mod
     import w1x.config as config
     import w1x.models as models
 
@@ -29,8 +30,7 @@ def main():
 
         models.installed_models = initially_empty_models
         try:
-            from w1x.app import main as run_app
-            run_app()
+            app_mod.main()
         finally:
             for name, path in original_paths.items():
                 setattr(config, name, path)

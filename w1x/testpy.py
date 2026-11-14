@@ -1,15 +1,16 @@
-# -*- coding: utf-8 -*-
 """Модуль интерактивного запуска и отладки Python-кода в отдельном окне терминала CMD."""
+import ast
 import os
 import re
-import sys
-import ast
 import shutil
-import tempfile
 import subprocess
+import sys
+import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 
 from .terminal import console, render_message
+from .types import ChatMessage
 
 
 def is_valid_python(code_str: str) -> bool:
@@ -17,7 +18,7 @@ def is_valid_python(code_str: str) -> bool:
     cleaned = code_str.strip()
     if not cleaned:
         return False
-    lines = [l.strip() for l in cleaned.splitlines() if l.strip()]
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
     if len(lines) <= 2 and any(
         lines[0].lower().startswith(cmd)
         for cmd in ("python ", "python3 ", "py ", "pip ", "cd ", "npm ", "git ")
@@ -46,24 +47,27 @@ def is_valid_python(code_str: str) -> bool:
         return False
 
 
-def extract_latest_python_code(messages):
+def extract_latest_python_code(messages: Sequence[ChatMessage]) -> str:
     """Извлечь последний реальный блок Python-кода из ответов ассистента."""
     for message in reversed(messages):
         if message.get("role") != "assistant":
             continue
         content = str(message.get("content") or "")
 
-        # 1. Ищем блоки в тройных кавычках ``` ... ```
-        blocks = list(re.finditer(r"```(?:[a-zA-Z0-9_-]+)?\r?\n([\s\S]*?)```", content))
+        # 1. Ищем блоки в тройных кавычках ``` ... ``` (только Python или без тега)
+        blocks = list(re.finditer(r"```([a-zA-Z0-9_-]*)\r?\n([\s\S]*?)```", content))
         for match in reversed(blocks):
-            candidate = match.group(1).strip()
+            lang = match.group(1).strip().lower()
+            if lang and lang not in {"python", "py", "python3"}:
+                continue
+            candidate = match.group(2).strip()
             if is_valid_python(candidate):
                 return candidate
 
         # 2. Если тройных кавычек нет, ищем непрерывный блок кода по ключевым словам
         lines = content.splitlines()
-        code_candidates = []
-        current_chunk = []
+        code_candidates: list[str] = []
+        current_chunk: list[str] = []
         for line in lines:
             if re.match(
                 r"^\s*(?:def\s|import\s|from\s|class\s|if\s|for\s|while\s|try:|#|print\(|input\()",
@@ -103,11 +107,10 @@ def run_interactive_python_test(code: str) -> tuple[int, str]:
     log_file = temp_dir / "session_log.txt"
     exit_code_file = temp_dir / "exit_code.txt"
 
-    script_file.write_text(code, encoding="utf-8")
-
     runner_code = """# -*- coding: utf-8 -*-
 import os
 import sys
+import inspect
 import traceback
 import builtins
 
@@ -138,6 +141,7 @@ class TeeStream:
         except Exception:
             pass
         self.collector.append(data)
+        return len(data)
 
     def flush(self):
         try:
@@ -178,6 +182,11 @@ def main():
 
     while True:
         run_count += 1
+        try:
+            with open(exit_code_path, "w", encoding="utf-8") as f:
+                f.write("1")
+        except Exception:
+            pass
         if run_count == 1:
             if os.name == "nt":
                 os.system("cls")
@@ -227,9 +236,25 @@ def main():
                     "cli",
                 ]
                 for ep in entry_points:
-                    if ep in global_scope and callable(global_scope[ep]):
-                        global_scope[ep]()
-                        break
+                    fn = global_scope.get(ep)
+                    if callable(fn):
+                        try:
+                            sig = inspect.signature(fn)
+                            requires_args = any(
+                                p.default is inspect.Parameter.empty
+                                and p.kind
+                                in (
+                                    inspect.Parameter.POSITIONAL_ONLY,
+                                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                    inspect.Parameter.KEYWORD_ONLY,
+                                )
+                                for p in sig.parameters.values()
+                            )
+                        except (TypeError, ValueError):
+                            requires_args = True
+                        if not requires_args:
+                            fn()
+                            break
         except SystemExit as exc:
             exit_code = exc.code if isinstance(exc.code, int) else (1 if exc.code is not None else 0)
         except KeyboardInterrupt:
@@ -293,16 +318,17 @@ if __name__ == "__main__":
         except Exception:
             pass
 """
-    runner_file.write_text(runner_code, encoding="utf-8")
-
-    console.print()
-    render_message("Открываю отдельное окно CMD для тестирования…", role="tool")
-    console.print("[dim]Окно открыто. Протестируйте программу и завершите её для возврата в чат.[/dim]")
-
     creation_flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if os.name == "nt" else 0
     exit_code = 0
     log_content = ""
     try:
+        script_file.write_text(code, encoding="utf-8")
+        runner_file.write_text(runner_code, encoding="utf-8")
+
+        console.print()
+        render_message("Открываю отдельное окно CMD для тестирования…", role="tool")
+        console.print("[dim]Окно открыто. Протестируйте программу и завершите её для возврата в чат.[/dim]")
+
         proc = subprocess.run(
             [sys.executable, str(runner_file)],
             creationflags=creation_flags,

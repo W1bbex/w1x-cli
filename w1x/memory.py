@@ -1,20 +1,22 @@
-# -*- coding: utf-8 -*-
 """Долговременная память фактов W1x."""
 import json
 import re
 import secrets
 import shutil
 import time
+from collections.abc import Sequence
 from datetime import datetime
+from pathlib import Path
 
 from . import config
+from .types import ChatMessage, MemoryFact
 
 
-def _get_facts_path():
+def _get_facts_path() -> Path | None:
     return getattr(config, "FACTS_PATH", None)
 
 
-def _get_chat_dir():
+def _get_chat_dir() -> Path | None:
     return getattr(config, "CHAT_DIR", None)
 
 _MEMORY_STOPWORDS = {
@@ -34,13 +36,12 @@ _GENERAL_MEMORY_PATTERNS = (
 )
 
 
-def load_facts():
+def load_facts() -> list[MemoryFact]:
     """Загрузить отдельную постоянную память фактов."""
     facts_p = _get_facts_path()
     if not facts_p or not facts_p.exists():
         return []
     try:
-        facts_p = _get_facts_path()
         payload = json.loads(facts_p.read_text(encoding="utf-8"))
     except (ValueError, TypeError):
         try:
@@ -57,7 +58,7 @@ def load_facts():
     if not isinstance(payload, list):
         return []
     return [
-        item
+        item  # type: ignore[misc]
         for item in payload
         if isinstance(item, dict)
         and isinstance(item.get("fact"), str)
@@ -65,15 +66,26 @@ def load_facts():
     ]
 
 
-def save_facts(facts):
-    _get_chat_dir().mkdir(parents=True, exist_ok=True)
+def save_facts(facts: Sequence[MemoryFact]) -> bool:
     facts_p = _get_facts_path()
+    if not facts_p:
+        return False
     temporary_path = facts_p.with_suffix(".tmp")
-    temporary_path.write_text(
-        json.dumps(facts, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    temporary_path.replace(facts_p)
+    try:
+        facts_p.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path.write_text(
+            json.dumps(facts, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary_path.replace(facts_p)
+        return True
+    except OSError:
+        if temporary_path.exists():
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+        return False
 
 
 def remember_fact(fact: str) -> str:
@@ -85,7 +97,7 @@ def remember_fact(fact: str) -> str:
     Returns:
         Подтверждение сохранения факта.
     """
-    fact = " ".join(str(fact).split()).strip(" .")
+    fact = " ".join(str("" if fact is None else fact).split()).strip(" .")
     if not fact:
         return "Ошибка: нечего запоминать."
     if len(fact) > 500:
@@ -103,7 +115,8 @@ def remember_fact(fact: str) -> str:
             "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
     )
-    save_facts(facts[-200:])
+    if not save_facts(facts[-200:]):
+        return "Ошибка: не удалось сохранить память."
     return f"Запомнил: {fact}."
 
 
@@ -125,9 +138,9 @@ def _stem_word(word: str) -> str:
 
 def _memory_words(text: str) -> set[str]:
     words = set()
-    for raw in re.findall(r"[a-zа-яё0-9_-]{2,}", text.casefold()):
+    safe_text = "" if text is None else str(text)
+    for raw in re.findall(r"[a-zа-яё0-9_-]{2,}", safe_text.casefold()):
         if raw not in _MEMORY_STOPWORDS:
-            words.add(raw)
             stem = _stem_word(raw)
             if stem:
                 words.add(stem)
@@ -135,7 +148,7 @@ def _memory_words(text: str) -> set[str]:
 
 
 def _is_general_query(query: str) -> bool:
-    q = query.casefold().strip()
+    q = ("" if query is None else str(query)).casefold().strip()
     if not q:
         return True
     return any(re.search(pat, q) for pat in _GENERAL_MEMORY_PATTERNS)
@@ -150,16 +163,17 @@ def recall_facts(query: str = "") -> str:
     Returns:
         Найденные факты или сообщение, что совпадений нет.
     """
+    safe_query = "" if query is None else str(query)
     facts = load_facts()
     if not facts:
         return "Постоянная память фактов пуста."
 
-    if _is_general_query(query):
+    if _is_general_query(safe_query):
         return "Факты из постоянной памяти:\n" + "\n".join(
             f"- {item['fact']}" for item in facts[-20:]
         )
 
-    query_words = _memory_words(query)
+    query_words = _memory_words(safe_query)
     ranked = []
     for index, item in enumerate(facts):
         fact_words = _memory_words(item["fact"])
@@ -211,7 +225,8 @@ def forget_facts(query: str) -> str:
             kept.append(item)
     if not removed:
         return "Подходящий факт в памяти не найден."
-    save_facts(kept)
+    if not save_facts(kept):
+        return "Ошибка: не удалось обновить память."
     return "Забыл: " + "; ".join(removed) + "."
 
 
@@ -226,17 +241,18 @@ def memory(action: str, text: str = "") -> str:
     Returns:
         Результат операции с постоянной памятью пользователя.
     """
-    action = action.strip().casefold()
-    if action == "remember":
-        return remember_fact(text)
-    if action == "recall":
-        return recall_facts(text)
-    if action == "forget":
-        return forget_facts(text)
+    normalized_action = ("" if action is None else str(action)).strip().casefold()
+    safe_text = "" if text is None else str(text)
+    if normalized_action == "remember":
+        return remember_fact(safe_text)
+    if normalized_action == "recall":
+        return recall_facts(safe_text)
+    if normalized_action == "forget":
+        return forget_facts(safe_text)
     return "Ошибка: action должен быть remember, recall или forget."
 
 
-def relevant_memory_block(query=""):
+def relevant_memory_block(query: str = "") -> str:
     facts = load_facts()
     if not facts:
         return ""
@@ -249,7 +265,7 @@ def relevant_memory_block(query=""):
     return "" if recalled.endswith("пуста.") or "нет подходящего" in recalled else recalled
 
 
-def extract_remember_request(text):
+def extract_remember_request(text: str) -> str:
     match = re.match(
         r"^\s*(?:запомни|запиши\s+в\s+память|сохрани\s+в\s+память)"
         r"\s*[:,-]?\s*(.+?)\s*$",
@@ -259,7 +275,7 @@ def extract_remember_request(text):
     return match.group(1).strip() if match else ""
 
 
-def extract_forget_request(text):
+def extract_forget_request(text: str) -> str:
     match = re.match(
         r"^\s*(?:забудь|удали\s+из\s+памяти)\s*[:,-]?\s*(.+?)\s*$",
         text,
@@ -268,7 +284,7 @@ def extract_forget_request(text):
     return match.group(1).strip() if match else ""
 
 
-def looks_like_memory_question(text):
+def looks_like_memory_question(text: str) -> bool:
     normalized = text.casefold()
     return bool(
         re.search(r"\b(?:помнишь|вспомни|забыл\w*)\b", normalized)
@@ -277,16 +293,30 @@ def looks_like_memory_question(text):
     )
 
 
-def migrate_explicit_memory(messages):
+def migrate_explicit_memory(messages: Sequence[ChatMessage]) -> int:
     """Один раз подобрать старые фразы «запомни» из сохранённого диалога."""
+    facts = load_facts()
+    existing = {item["fact"].casefold() for item in facts}
     migrated = 0
     for message in messages:
         if message.get("role") != "user":
             continue
-        fact = extract_remember_request(message.get("content", ""))
-        if not fact:
+        fact = extract_remember_request(message.get("content", "") or "")
+        cleaned = " ".join(fact.split()).strip(" .")
+        if not cleaned or len(cleaned) > 500:
             continue
-        before = len(load_facts())
-        remember_fact(fact)
-        migrated += len(load_facts()) > before
+        normalized = cleaned.casefold()
+        if normalized in existing:
+            continue
+        existing.add(normalized)
+        facts.append(
+            {
+                "id": secrets.token_hex(4),
+                "fact": cleaned,
+                "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+        )
+        migrated += 1
+    if migrated and not save_facts(facts[-200:]):
+        return 0
     return migrated

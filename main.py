@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """W1x CLI — Fast & Intelligent Terminal AI Client for Ollama.
 
 Run directly with: python main.py
@@ -12,7 +11,7 @@ APP_DIR = Path(__file__).resolve().parent
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
-from w1x.app import main
+from w1x.app import main  # noqa: E402
 
 if __name__ == "__main__":
     main()

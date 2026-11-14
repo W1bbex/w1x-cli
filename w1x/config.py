@@ -1,7 +1,11 @@
 import json
 import logging
+import subprocess
 import threading
 from pathlib import Path
+from typing import Any
+
+from .types import UserConfig
 
 logger = logging.getLogger("w1x")
 
@@ -23,7 +27,7 @@ try:
 except Exception:
     pass
 
-DEFAULT_CONFIG = {
+DEFAULT_CONFIG: UserConfig = {
     "default_model": "qwen3.5:4b",
     "keep_alive_minutes": 30,
     "context_tokens": 8192,
@@ -36,24 +40,25 @@ def is_first_run() -> bool:
     return not CONFIG_FILE_PATH.exists()
 
 
-def load_user_config():
+def load_user_config() -> UserConfig:
     if not CONFIG_FILE_PATH.exists():
-        return dict(DEFAULT_CONFIG)
+        return dict(DEFAULT_CONFIG)  # type: ignore[return-value]
     try:
         data = json.loads(CONFIG_FILE_PATH.read_text(encoding="utf-8"))
         if isinstance(data, dict):
-            cfg = dict(DEFAULT_CONFIG)
+            cfg: dict[str, Any] = dict(DEFAULT_CONFIG)
             cfg.update(data)
-            return cfg
+            return cfg  # type: ignore[return-value]
         logger.warning("Corrupted config file %s (expected JSON object); using defaults", CONFIG_FILE_PATH)
     except Exception as exc:
         logger.warning("Failed to load config file %s: %s; using defaults", CONFIG_FILE_PATH, exc)
-    return dict(DEFAULT_CONFIG)
+    return dict(DEFAULT_CONFIG)  # type: ignore[return-value]
 
 
-def save_user_config(cfg) -> bool:
+def save_user_config(cfg: UserConfig | dict[str, Any]) -> bool:
     tmp_path = CONFIG_FILE_PATH.with_suffix(".tmp")
     try:
+        CONFIG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp_path.write_text(
             json.dumps(cfg, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -70,7 +75,7 @@ def save_user_config(cfg) -> bool:
         return False
 
 
-def get_keep_alive():
+def get_keep_alive() -> str:
     try:
         mins = int(load_user_config().get("keep_alive_minutes", 30))
     except Exception:
@@ -80,14 +85,14 @@ def get_keep_alive():
     return f"{mins}m"
 
 
-def get_context_tokens():
+def get_context_tokens() -> int:
     try:
         return int(load_user_config().get("context_tokens", 8192))
     except Exception:
         return 8192
 
 
-def get_max_history_chars():
+def get_max_history_chars() -> int:
     return int(get_context_tokens() * 3.5)
 
 
@@ -98,11 +103,11 @@ AGY_TIMEOUT_SECONDS = 240
 AGY_MAX_PROMPT_CHARS = 5500
 AGY_MAX_OUTPUT_CHARS = 30000
 
-ACTIVE_FILE_ROOT = None
-ACTIVE_AGY_PROCESS = None
+ACTIVE_FILE_ROOT: Path | None = None
+ACTIVE_AGY_PROCESS: subprocess.Popen[str] | None = None
 ACTIVE_AGY_LOCK = threading.Lock()
 
-ACTIVE_SESSION_DATA = {
+ACTIVE_SESSION_DATA: dict[str, Any] = {
     "messages": [],
     "system_prompt": "",
 }
@@ -186,6 +191,8 @@ COMMAND_HINTS = {
     "/models": "список установленных моделей",
     "/model": "сменить модель (стрелки / Enter)",
     "/pull": "скачать модель из библиотеки Ollama",
+    "/unload": "выгрузить активные модели из VRAM",
+    "/free": "выгрузить активные модели из VRAM",
     "/config": "настройки контекста, VRAM и модели",
     "/new": "начать новый диалог",
     "/clear": "начать новый диалог",
