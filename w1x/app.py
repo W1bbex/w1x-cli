@@ -1,11 +1,14 @@
 """Главный интерфейс приложения W1x, слэш-команды и цикл диалога."""
+import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
+from rich.markup import escape as escape_markup
 from rich.panel import Panel
 
 from . import config
+from . import models as models_mod
 from .catalog_ui import first_time_setup_wizard
 from .chat_store import (
     load_current_chat,
@@ -27,7 +30,6 @@ from .memory import (
 )
 from .models import (
     get_last_model,
-    installed_models,
     register_console_ctrl_handler,
     reset_all_models,
     start_background_preload,
@@ -37,20 +39,30 @@ from .models import (
 from .models_ui import choose_model, interactive_config_menu, print_models
 from .pull_manager import GLOBAL_PULL_MANAGER
 from .stats import add_to_totals, direct_tool_stats, empty_totals
+from prompt_toolkit.formatted_text import HTML
+
+from .clipboard import copy_to_clipboard
+from .prompts import (
+    read_input,
+    secondary_session,
+    set_undo_persist_callback,
+)
 from .terminal import (
     configure_utf8_console,
     console,
-    copy_to_clipboard,
     print_stats,
-    read_input,
     render_message,
-    set_undo_persist_callback,
     show_terminal_emoji_hint,
 )
 from .testpy import extract_latest_python_code, run_interactive_python_test
 from .tools.antigravity import run_agy_for_user, should_auto_escalate
 from .tools.workspace import set_file_workspace
 from .types import ChatMessage, SessionTotals, StatsRecord
+
+
+def installed_models() -> list[str]:
+    """Вернуть установленные модели через текущую ссылку модуля models."""
+    return models_mod.installed_models()
 
 
 @dataclass
@@ -65,6 +77,73 @@ class _SessionState:
     last_stats: StatsRecord | None = None
     totals: SessionTotals = field(default_factory=empty_totals)
     last_response: str = ""
+    cancelled_prompt: str = ""
+
+    def __post_init__(self) -> None:
+        self.sync_active_data()
+
+    def sync_active_data(self) -> None:
+        """Синхронизировать состояние с глобальным фасадом для обратной совместимости."""
+        config.ACTIVE_SESSION_DATA["messages"] = self.messages
+        config.ACTIVE_SESSION_DATA["system_prompt"] = self.system_prompt
+        if self.cancelled_prompt:
+            config.ACTIVE_SESSION_DATA["cancelled_prompt"] = self.cancelled_prompt
+        else:
+            config.ACTIVE_SESSION_DATA.pop("cancelled_prompt", None)
+
+    def set_cancelled_prompt(self, prompt: str) -> None:
+        self.cancelled_prompt = prompt
+        config.ACTIVE_SESSION_DATA["cancelled_prompt"] = prompt
+
+    def pop_cancelled_prompt(self) -> str:
+        res = self.cancelled_prompt or str(config.ACTIVE_SESSION_DATA.pop("cancelled_prompt", "") or "")
+        self.cancelled_prompt = ""
+        config.ACTIVE_SESSION_DATA.pop("cancelled_prompt", None)
+        return res
+
+    def append_user_message(self, prompt: str) -> None:
+        self.pop_cancelled_prompt()
+        self.messages.append({"role": "user", "content": prompt})
+        self.sync_active_data()
+
+    def append_assistant_reply(self, reply: str, stats: StatsRecord | None) -> None:
+        self.pop_cancelled_prompt()
+        self.messages.append({"role": "assistant", "content": reply})
+        self.last_response = reply
+        self.last_stats = stats
+        if stats:
+            add_to_totals(self.totals, stats)
+        self.sync_active_data()
+
+    def reset_context(self) -> None:
+        self.pop_cancelled_prompt()
+        self.messages = new_context(self.system_prompt)
+        self.last_stats = None
+        self.last_response = ""
+        self.totals = empty_totals()
+        self.sync_active_data()
+
+    def undo_turn(self) -> bool:
+        self.pop_cancelled_prompt()
+        removed = False
+        if self.messages and self.messages[-1].get("role") == "assistant":
+            self.messages.pop()
+            removed = True
+        if self.messages and self.messages[-1].get("role") == "user":
+            self.messages.pop()
+            removed = True
+        if removed:
+            self.last_response = next(
+                (item["content"] for item in reversed(self.messages) if item["role"] == "assistant"),
+                "",
+            )
+            self.sync_active_data()
+        return removed
+
+    def rollback_last_turn(self) -> None:
+        if self.messages and self.messages[-1].get("role") == "user":
+            self.messages.pop()
+        self.sync_active_data()
 
 
 def print_status(
@@ -72,21 +151,34 @@ def print_status(
     think_mode: bool | str,
     stats_enabled: bool,
     messages: Sequence[ChatMessage],
+    totals: SessionTotals | None = None,
 ) -> None:
     """Вывести панель текущего состояния сессии и модели."""
     think_text = "выключен" if not think_mode else str(think_mode)
     turns = sum(message["role"] == "user" for message in messages)
+    lines = [
+        f"Модель: [bold]{model}[/bold]",
+        "ИИ: [bold]W1x[/bold]  •  разработчик: [bold]W1bbex[/bold]",
+        f"Сборка: [bold]{APP_VERSION}[/bold]",
+        f"Thinking: [bold]{think_text}[/bold]",
+        "Инструменты: [bold]поиск, время, калькулятор, Python, память, "
+        "файлы, Antigravity[/bold]",
+        f"Папка проекта: [bold]{escape_markup(str(config.ACTIVE_FILE_ROOT)) if config.ACTIVE_FILE_ROOT else 'не выбрана'}[/bold]",
+        f"Статистика: [bold]{'включена' if stats_enabled else 'выключена'}[/bold]",
+        f"Сообщений пользователя: [bold]{turns}[/bold]",
+    ]
+    if totals and totals.get("requests", 0) > 0:
+        reqs = totals.get("requests", 0)
+        tot_tok = totals.get("total_tokens", 0)
+        prompt_tok = totals.get("prompt_tokens", 0)
+        out_tok = totals.get("output_tokens", 0)
+        lines.append(
+            f"Токенов за сессию: [bold]{tot_tok:,}[/bold] ([dim]вход: {prompt_tok:,}, выход: {out_tok:,}[/dim]) "
+            f"в [bold]{reqs}[/bold] ответах"
+        )
     console.print(
         Panel(
-            f"Модель: [bold]{model}[/bold]\n"
-            f"ИИ: [bold]W1x[/bold]  •  разработчик: [bold]W1bbex[/bold]\n"
-            f"Сборка: [bold]{APP_VERSION}[/bold]\n"
-            f"Thinking: [bold]{think_text}[/bold]\n"
-            "Инструменты: [bold]поиск, время, калькулятор, Python, память, "
-            "файлы, Antigravity[/bold]\n"
-            f"Папка проекта: [bold]{config.ACTIVE_FILE_ROOT or 'не выбрана'}[/bold]\n"
-            f"Статистика: [bold]{'включена' if stats_enabled else 'выключена'}[/bold]\n"
-            f"Сообщений пользователя: [bold]{turns}[/bold]",
+            "\n".join(lines),
             title="Состояние",
             border_style="cyan",
         )
@@ -159,8 +251,11 @@ Ctrl+V               вставить текст из буфера обмена
 def shutdown() -> None:
     """Выгрузить активные модели перед завершением CLI."""
     console.print()
-    reset_all_models()
-    console.print("[dim]Все модели выгружены.[/dim]")
+    unloaded = reset_all_models()
+    if unloaded:
+        console.print(f"[dim]Модели выгружены из памяти: {', '.join(unloaded)}[/dim]")
+    else:
+        console.print("[dim]Сессия завершена.[/dim]")
 
 
 def looks_like_launch_command(text: str) -> bool:
@@ -197,7 +292,7 @@ def _print_tools_panel() -> None:
 def _handle_workspace_cmd(argument: str) -> None:
     if not argument:
         console.print(
-            f"[dim]Текущая папка: {config.ACTIVE_FILE_ROOT or 'не выбрана'}[/dim]\n"
+            f"[dim]Текущая папка: {escape_markup(str(config.ACTIVE_FILE_ROOT)) if config.ACTIVE_FILE_ROOT else 'не выбрана'}[/dim]\n"
             "Используй: [cyan]/workspace C:\\путь\\к\\проекту[/cyan] "
             "или [cyan]/workspace off[/cyan]"
         )
@@ -209,10 +304,10 @@ def _handle_workspace_cmd(argument: str) -> None:
     try:
         selected_root = set_file_workspace(argument.strip('"'))
         console.print(
-            f"[green]Папка проекта выбрана только для чтения:[/green] {selected_root}"
+            f"[green]Папка проекта выбрана только для чтения:[/green] {escape_markup(str(selected_root))}"
         )
     except Exception as error:
-        console.print(f"[red]Не удалось выбрать папку: {error}[/red]")
+        console.print(f"[red]Не удалось выбрать папку: {escape_markup(str(error))}[/red]")
 
 
 def _handle_think_cmd(argument: str, think_mode: bool | str) -> bool | str:
@@ -237,15 +332,15 @@ def _handle_memory_cmd(messages: Sequence[ChatMessage]) -> None:
     turns = sum(item["role"] == "user" for item in messages)
     facts = load_facts()
     fact_preview = "\n".join(
-        f"• {item['fact']}" for item in facts[-10:]
+        f"• {escape_markup(item['fact'])}" for item in facts[-10:]
     ) or "Постоянных фактов пока нет."
     console.print(
         Panel(
             f"Сохранено сообщений пользователя: [bold]{turns}[/bold]\n"
             f"Лимит истории: [bold]{config.MAX_SAVED_MESSAGES} сообщений[/bold]\n"
             f"Постоянных фактов: [bold]{len(facts)}[/bold]\n"
-            f"Файл диалога: {config.CURRENT_CHAT_PATH}\n"
-            f"Файл фактов: {config.FACTS_PATH}\n\n"
+            f"Файл диалога: {escape_markup(str(config.CURRENT_CHAT_PATH))}\n"
+            f"Файл фактов: {escape_markup(str(config.FACTS_PATH))}\n\n"
             f"{fact_preview}\n\n"
             "[dim]/new очищает диалог, но не постоянные факты; "
             "/forget текст удаляет факт[/dim]",
@@ -269,7 +364,7 @@ def _handle_testpy_cmd(
 
     lines_count = len(code_to_test.splitlines())
     first_line = code_to_test.splitlines()[0][:60]
-    console.print(f"[dim]Тестирую Python-код ({lines_count} строк: '{first_line}')...[/dim]")
+    console.print(f"[dim]Тестирую Python-код ({lines_count} строк: '{escape_markup(first_line)}')...[/dim]")
 
     exit_code, log_content = run_interactive_python_test(code_to_test)
     if exit_code == 0:
@@ -337,8 +432,7 @@ def _handle_pull_cmd(argument: str, model: str) -> str:
 
 def _run_cli_oneshot(cli_args: list[str]) -> int:
     """Обработать одиночные CLI-аргументы и флаги без входа в интерактивный цикл."""
-    first_arg = cli_args[0].lower()
-    if first_arg in ("-h", "--help"):
+    if any(a.lower() in ("-h", "--help") for a in cli_args):
         console.print(
             f"[bold]w1x[/bold] v{APP_VERSION} — CLI-ассистент для Ollama\n\n"
             "Использование:\n"
@@ -354,7 +448,8 @@ def _run_cli_oneshot(cli_args: list[str]) -> int:
         )
         return 0
 
-    if first_arg in ("-v", "--version"):
+    first_arg = cli_args[0].lower()
+    if len(cli_args) == 1 and first_arg in ("-v", "--version"):
         console.print(f"w1x {APP_VERSION}")
         return 0
 
@@ -369,8 +464,8 @@ def _run_cli_oneshot(cli_args: list[str]) -> int:
         if not models_to_pull:
             first_time_setup_wizard()
             return 0
-        GLOBAL_PULL_MANAGER.run_cli_pull(models_to_pull)
-        return 0
+        success = GLOBAL_PULL_MANAGER.run_cli_pull(models_to_pull)
+        return 0 if success else 1
 
     if first_arg in ("--config", "-c", "config", "/config", "/settings"):
         interactive_config_menu()
@@ -387,6 +482,12 @@ def _run_cli_oneshot(cli_args: list[str]) -> int:
                 return 2
             requested_model = cli_args[i + 1]
             i += 2
+        elif arg.lower().startswith("--model="):
+            requested_model = arg.split("=", 1)[1].strip()
+            if not requested_model:
+                console.print("[red]Ошибка: для флага --model не указано имя модели.[/red]")
+                return 2
+            i += 1
         elif arg.startswith("-") and not question_parts:
             console.print(f"[red]Неизвестный флаг: {arg}. Используйте --help для справки.[/red]")
             return 2
@@ -396,11 +497,15 @@ def _run_cli_oneshot(cli_args: list[str]) -> int:
 
     models = installed_models()
     if not models:
+        if models_mod.LAST_LIST_ERROR is not None:
+            return 1
         console.print("[yellow]W1x: первый запуск. Выберите стартовую модель для загрузки:[/yellow]")
         downloaded = first_time_setup_wizard()
         if not downloaded:
             return 1
         models = installed_models()
+        if not models:
+            return 1
 
     if requested_model is not None:
         if requested_model not in models:
@@ -414,6 +519,10 @@ def _run_cli_oneshot(cli_args: list[str]) -> int:
         chosen_last = get_last_model(models)
         target_model = chosen_last if chosen_last is not None else models[0]
 
+    if not question_parts and requested_model is not None:
+        show_terminal_emoji_hint()
+        return _run_interactive_chat(target_model)
+
     question = " ".join(question_parts).strip() or "Привет!"
     messages: list[ChatMessage] = [
         {"role": "system", "content": config.DEFAULT_SYSTEM_PROMPT},
@@ -421,7 +530,10 @@ def _run_cli_oneshot(cli_args: list[str]) -> int:
     ]
     try:
         wait_for_model_ready(target_model)
-        generate_answer(target_model, messages, think_mode=False)
+        _, _, interrupted = generate_answer(target_model, messages, think_mode=False)
+        if interrupted:
+            console.print("\n[yellow]Прервано пользователем.[/yellow]")
+            return 130
         return 0
     except KeyboardInterrupt:
         console.print("\n[yellow]Прервано пользователем.[/yellow]")
@@ -439,13 +551,11 @@ def _record_direct_reply(
     state: _SessionState,
 ) -> None:
     """Записать мгновенный ответ инструмента или памяти в историю и обновить статистику."""
-    state.messages.append({"role": "user", "content": prompt_text})
-    state.messages.append({"role": "assistant", "content": reply_text})
+    stats = direct_tool_stats(tool_name, started_ns)
+    state.append_user_message(prompt_text)
+    state.append_assistant_reply(reply_text, stats)
     save_current_chat(state.system_prompt, state.messages)
-    state.last_response = reply_text
-    state.last_stats = direct_tool_stats(tool_name, started_ns)
-    add_to_totals(state.totals, state.last_stats)
-    if state.stats_enabled:
+    if state.stats_enabled and state.last_stats:
         print_stats(state.last_stats)
 
 
@@ -457,7 +567,8 @@ def _run_agy_turn(user_text: str, task_text: str, state: _SessionState) -> None:
     except KeyboardInterrupt:
         console.print("\n[yellow]Antigravity остановлена пользователем.[/yellow]")
         return
-    ACTIVE_SESSION_DATA.pop("cancelled_prompt", None)
+    if result.startswith("ESCALATE_ERROR:"):
+        return
     _record_direct_reply(user_text, result, "Antigravity", started_ns, state)
 
 
@@ -465,12 +576,23 @@ def _dispatch_slash_command(
     command: str, argument: str, state: _SessionState
 ) -> bool:
     """Обработать встроенную слэш-команду и вернуть True, если ход завершён."""
+    def _run_config_and_sync() -> None:
+        interactive_config_menu()
+        updated_cfg = load_user_config()
+        state.stats_enabled = bool(updated_cfg.get("stats_enabled", False))
+        configured_model = updated_cfg.get("default_model")
+        if configured_model and configured_model != state.model:
+            reset_all_models()
+            state.model = configured_model
+            start_background_preload(state.model)
+            print_header(state.model)
+
     simple_commands: dict[str, Callable[[], object]] = {
         "/help": print_help,
         "/?": print_help,
-        "/config": interactive_config_menu,
-        "/settings": interactive_config_menu,
-        "/настройки": interactive_config_menu,
+        "/config": _run_config_and_sync,
+        "/settings": _run_config_and_sync,
+        "/настройки": _run_config_and_sync,
         "/unload": lambda: reset_all_models(show_message=True),
         "/free": lambda: reset_all_models(show_message=True),
         "/models": lambda: print_models(installed_models()),
@@ -478,7 +600,11 @@ def _dispatch_slash_command(
         "/workspace": lambda: _handle_workspace_cmd(argument),
         "/memory": lambda: _handle_memory_cmd(state.messages),
         "/status": lambda: print_status(
-            state.model, state.think_mode, state.stats_enabled, state.messages
+            state.model,
+            state.think_mode,
+            state.stats_enabled,
+            state.messages,
+            state.totals,
         ),
     }
     if command in simple_commands:
@@ -499,12 +625,7 @@ def _dispatch_slash_command(
         return True
 
     if command in {"/new", "/clear"}:
-        ACTIVE_SESSION_DATA.pop("cancelled_prompt", None)
-        state.messages = new_context(state.system_prompt)
-        ACTIVE_SESSION_DATA["messages"] = state.messages
-        state.last_stats = None
-        state.last_response = ""
-        state.totals = empty_totals()
+        state.reset_context()
         save_current_chat(state.system_prompt, state.messages)
         console.print("[green]Новый диалог начат.[/green]")
         return True
@@ -540,24 +661,28 @@ def _dispatch_slash_command(
 
     if command == "/system":
         if not argument:
-            console.print(Panel(state.system_prompt, title="System prompt"))
+            console.print(Panel(escape_markup(state.system_prompt), title="System prompt"))
         else:
             state.system_prompt = argument
             state.messages[0] = {"role": "system", "content": state.system_prompt}
-            ACTIVE_SESSION_DATA["system_prompt"] = state.system_prompt
+            state.sync_active_data()
             save_current_chat(state.system_prompt, state.messages)
             console.print("[green]Системная инструкция обновлена.[/green]")
         return True
 
     if command == "/copy":
-        if not state.last_response:
+        resp_to_copy = next(
+            (item["content"] for item in reversed(state.messages) if item.get("role") == "assistant"),
+            state.last_response,
+        )
+        if not resp_to_copy:
             console.print("[dim]Ответа для копирования пока нет.[/dim]")
             return True
         try:
-            copy_to_clipboard(state.last_response)
+            copy_to_clipboard(resp_to_copy)
             console.print("[green]Последний ответ скопирован.[/green]")
         except Exception as error:
-            console.print(f"[red]Не удалось скопировать: {error}[/red]")
+            console.print(f"[red]Не удалось скопировать: {escape_markup(str(error))}[/red]")
         return True
 
     if command == "/testpy":
@@ -569,9 +694,9 @@ def _dispatch_slash_command(
     if command == "/save":
         try:
             path = save_chat(state.messages, argument)
-            console.print(f"[green]Диалог сохранён:[/green] {path}")
+            console.print(f"[green]Диалог сохранён:[/green] {escape_markup(str(path))}")
         except Exception as error:
-            console.print(f"[red]Не удалось сохранить: {error}[/red]")
+            console.print(f"[red]Не удалось сохранить: {escape_markup(str(error))}[/red]")
         return True
 
     if command == "/undo":
@@ -626,9 +751,8 @@ def _execute_chat_turn(
             return
         retry_user_prompt = messages[-1]["content"]
     else:
-        ACTIVE_SESSION_DATA.pop("cancelled_prompt", None)
         retry_user_prompt = prompt
-        messages.append({"role": "user", "content": prompt})
+        state.append_user_message(prompt)
 
     try:
         wait_for_model_ready(state.model)
@@ -637,20 +761,23 @@ def _execute_chat_turn(
             messages,
             state.think_mode,
         )
+    except KeyboardInterrupt:
+        interrupted = True
+        response, response_stats = "", None
     except Exception as error:
-        if not retrying and messages and messages[-1].get("role") == "user":
-            messages.pop()
+        if not retrying:
+            state.rollback_last_turn()
         save_current_chat(state.system_prompt, messages)
         console.print(
             f"\n[bold red]Ошибка Ollama:[/bold red] "
-            f"{type(error).__name__}: {error}"
+            f"{type(error).__name__}: {escape_markup(str(error))}"
         )
         return
 
     if interrupted:
-        ACTIVE_SESSION_DATA["cancelled_prompt"] = retry_user_prompt
-        if not retrying and messages and messages[-1].get("role") == "user":
-            messages.pop()
+        state.set_cancelled_prompt(retry_user_prompt)
+        if not retrying:
+            state.rollback_last_turn()
         save_current_chat(state.system_prompt, messages)
         if retrying:
             console.print("[yellow]Генерация остановлена. Исходный вопрос сохранён — можешь повторить `/retry`.[/yellow]")
@@ -660,47 +787,24 @@ def _execute_chat_turn(
         return
 
     if not response:
-        if not retrying and messages and messages[-1].get("role") == "user":
-            messages.pop()
+        if not retrying:
+            state.rollback_last_turn()
         save_current_chat(state.system_prompt, messages)
         console.print("[yellow]Модель не вернула текст.[/yellow]")
         return
 
-    ACTIVE_SESSION_DATA.pop("cancelled_prompt", None)
-    messages.append({"role": "assistant", "content": response})
+    state.append_assistant_reply(response, response_stats)
     save_current_chat(state.system_prompt, messages)
-    state.last_response = response
-    state.last_stats = response_stats
-    add_to_totals(state.totals, response_stats)
 
-    if state.stats_enabled:
+    if state.stats_enabled and state.last_stats:
         print_stats(state.last_stats)
 
     if "```" in response and any(kw in response for kw in ("```python", "```py", "def ", "import ")):
         console.print("[dim]💡 Протестировать код в отдельном окне: [cyan]/testpy[/cyan][/dim]")
 
 
-def main() -> None:
-    """Точка входа CLI-приложения W1x."""
-    import sys
-
-    configure_utf8_console()
-    register_console_ctrl_handler()
-    set_undo_persist_callback(save_current_chat)
-
-    cli_args = sys.argv[1:]
-    if cli_args:
-        exit_code = _run_cli_oneshot(cli_args)
-        if exit_code:
-            raise SystemExit(exit_code)
-        return
-
-    show_terminal_emoji_hint()
-    model = choose_model()
-    if model is None:
-        shutdown()
-        return
-
+def _run_interactive_chat(model: str) -> int:
+    """Запустить основной интерактивный цикл чата с выбранной моделью."""
     # Запускаем прогрев в фоне: поле ввода открывается мгновенно, не блокируя пользователя!
     start_background_preload(model)
 
@@ -746,7 +850,7 @@ def main() -> None:
             continue
         except EOFError:
             shutdown()
-            return
+            return 0
 
         if not prompt:
             continue
@@ -755,25 +859,74 @@ def main() -> None:
         command = command_line[0].lower()
         argument = command_line[1].strip() if len(command_line) > 1 else ""
 
-        if prompt.lower() in EXIT_COMMANDS:
-            shutdown()
-            return
+        try:
+            if prompt.lower() in EXIT_COMMANDS:
+                shutdown()
+                return 0
 
-        if looks_like_launch_command(prompt):
-            console.print(
-                "[yellow]Это команда запуска Python. Сейчас ты внутри чата: "
-                "введи q, а затем выполни команду в CMD или PowerShell.[/yellow]"
-            )
+            if looks_like_launch_command(prompt):
+                console.print(
+                    "[yellow]Это команда запуска Python. Сейчас ты внутри чата: "
+                    "введи q, а затем выполни команду в CMD или PowerShell.[/yellow]"
+                )
+                continue
+
+            if _dispatch_slash_command(command, argument, state):
+                continue
+
+            if _try_memory_shortcut(prompt, state):
+                continue
+
+            if command != "/retry" and should_auto_escalate(prompt):
+                is_explicit_agy = bool(
+                    re.search(r"\b(?:agy|антигравити)\b", prompt.casefold())
+                    or re.search(
+                        r"\b(?:передай|эскалируй|спроси|отдай)\w*\b.*\b(?:старш|сильн|другой)\w*\s+(?:ии|модел)",
+                        prompt.casefold(),
+                    )
+                )
+                if not is_explicit_agy:
+                    console.print(
+                        "\n[cyan]💡 Запрос похож на сложную задачу для старшей модели.[/cyan]"
+                    )
+                    try:
+                        confirm = secondary_session.prompt(
+                            HTML("<b><ansicyan>Передать задачу в Antigravity? [y/N] › </ansicyan></b>")
+                        ).strip().lower()
+                    except (KeyboardInterrupt, EOFError):
+                        confirm = "n"
+                    if confirm not in {"y", "yes", "д", "да"}:
+                        _execute_chat_turn(prompt, retrying=False, state=state)
+                        continue
+
+                _run_agy_turn(prompt, prompt, state)
+                continue
+
+            _execute_chat_turn(prompt, retrying=(command == "/retry"), state=state)
+        except KeyboardInterrupt:
+            console.print("\n[dim]Действие прервано. Для выхода введи q или /exit.[/dim]")
             continue
 
-        if _dispatch_slash_command(command, argument, state):
-            continue
 
-        if _try_memory_shortcut(prompt, state):
-            continue
+def main() -> None:
+    """Точка входа CLI-приложения W1x."""
+    import sys
 
-        if command != "/retry" and should_auto_escalate(prompt):
-            _run_agy_turn(prompt, prompt, state)
-            continue
+    configure_utf8_console()
+    register_console_ctrl_handler()
+    set_undo_persist_callback(save_current_chat)
 
-        _execute_chat_turn(prompt, retrying=(command == "/retry"), state=state)
+    cli_args = sys.argv[1:]
+    if cli_args:
+        exit_code = _run_cli_oneshot(cli_args)
+        if exit_code:
+            raise SystemExit(exit_code)
+        return
+
+    show_terminal_emoji_hint()
+    model = choose_model()
+    if model is None:
+        reset_all_models()
+        return
+
+    _run_interactive_chat(model)

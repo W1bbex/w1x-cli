@@ -6,6 +6,7 @@ from typing import Any
 
 from ollama import generate, ps
 from ollama import list as ollama_list
+from rich.markup import escape as escape_markup
 from rich.panel import Panel
 
 from .config import (
@@ -17,6 +18,7 @@ from .config import (
 from .terminal import console, run_with_spinner
 
 LAST_LIST_ERROR: Exception | None = None
+_LIST_LOCK = threading.Lock()
 _CONSOLE_CTRL_HANDLER_REF: Any = None
 
 
@@ -28,30 +30,41 @@ def model_name(item: Any) -> str | None:
     return str(raw) if raw else None
 
 
-def installed_models() -> list[str]:
+def installed_models(*, show_error: bool = True) -> list[str]:
     """Вернуть список установленных в Ollama моделей или [] при ошибке."""
     global LAST_LIST_ERROR
-    try:
-        names = [model_name(item) for item in ollama_list().models]
-        LAST_LIST_ERROR = None
-        return [name for name in names if name]
-    except Exception as error:
-        LAST_LIST_ERROR = error
-        err_str = str(error).lower()
-        if any(w in err_str for w in ("connection", "connect", "refused", "111", "10061")):
-            console.print(
-                Panel(
-                    "[bold red]❌ Не удалось подключиться к серверу Ollama.[/bold red]\n\n"
-                    "• Убедитесь, что [bold green]Ollama[/bold green] запущена в Windows (значок в трее рядом с часами).\n"
-                    "• Если Ollama ещё не установлена — скачайте её с официального сайта: [bold cyan]https://ollama.com[/bold cyan]",
-                    title="[bold]Сервер Ollama недоступен[/bold]",
-                    border_style="red",
-                    padding=(1, 2),
-                )
-            )
-        else:
-            console.print(f"[red]Не удалось получить список моделей: {error}[/red]")
-        return []
+    with _LIST_LOCK:
+        try:
+            names = [model_name(item) for item in ollama_list().models]
+            clean_names = [name for name in names if name]
+            LAST_LIST_ERROR = None
+            return clean_names
+        except Exception as error:
+            LAST_LIST_ERROR = error
+            if show_error:
+                err_str = str(error).lower()
+                if any(w in err_str for w in ("connection", "connect", "refused", "111", "10061")):
+                    console.print(
+                        Panel(
+                            "[bold red]❌ Не удалось подключиться к серверу Ollama.[/bold red]\n\n"
+                            "• Убедитесь, что [bold green]Ollama[/bold green] запущена в Windows (значок в трее рядом с часами).\n"
+                            "• Если Ollama ещё не установлена — скачайте её с официального сайта: [bold cyan]https://ollama.com[/bold cyan]",
+                            title="[bold]Сервер Ollama недоступен[/bold]",
+                            border_style="red",
+                            padding=(1, 2),
+                        )
+                    )
+                else:
+                    console.print(f"[red]Не удалось получить список моделей: {escape_markup(str(error))}[/red]")
+            return []
+
+
+def get_installed_models_with_status(
+    *, show_error: bool = True
+) -> tuple[list[str], Exception | None]:
+    """Получить список установленных в Ollama моделей и объект ошибки (если возникла)."""
+    names = installed_models(show_error=show_error)
+    return names, LAST_LIST_ERROR
 
 
 def running_models() -> list[str]:
@@ -107,6 +120,11 @@ def register_console_ctrl_handler() -> None:
 
 def reset_all_models(show_message: bool = False) -> list[str]:
     """Выгрузить модели из памяти и при необходимости вывести результат пользователю."""
+    global _CURRENT_PRELOAD
+    with _PRELOAD_LOCK:
+        if _CURRENT_PRELOAD is not None:
+            _CURRENT_PRELOAD.cancelled = True
+            _CURRENT_PRELOAD = None
     unloaded = unload_all_models()
     if show_message:
         if unloaded:
@@ -124,6 +142,7 @@ class PreloadTask:
         self.event = threading.Event()
         self.error: Exception | None = None
         self.thread: threading.Thread | None = None
+        self.cancelled: bool = False
 
 
 _CURRENT_PRELOAD: PreloadTask | None = None
@@ -132,6 +151,8 @@ _PRELOAD_LOCK = threading.Lock()
 
 def _background_preload_worker(task: PreloadTask) -> None:
     try:
+        if task.cancelled:
+            return
         generate(
             model=task.name,
             prompt="",
@@ -139,7 +160,8 @@ def _background_preload_worker(task: PreloadTask) -> None:
             options={"num_ctx": get_context_tokens()},
         )
     except Exception as e:
-        task.error = e
+        if not task.cancelled:
+            task.error = e
     finally:
         task.event.set()
 
@@ -150,6 +172,8 @@ def start_background_preload(name: str) -> None:
     with _PRELOAD_LOCK:
         if _CURRENT_PRELOAD is not None and _CURRENT_PRELOAD.name == name and not _CURRENT_PRELOAD.event.is_set():
             return
+        if _CURRENT_PRELOAD is not None and not _CURRENT_PRELOAD.event.is_set():
+            _CURRENT_PRELOAD.cancelled = True
         task = PreloadTask(name)
         worker = threading.Thread(
             target=_background_preload_worker,
@@ -175,7 +199,8 @@ def wait_for_model_ready(name: str | None = None) -> None:
     if task.event.is_set():
         if task.error:
             with _PRELOAD_LOCK:
-                _CURRENT_PRELOAD = None
+                if _CURRENT_PRELOAD is task:
+                    _CURRENT_PRELOAD = None
             raise task.error
         return
 
@@ -185,22 +210,9 @@ def wait_for_model_ready(name: str | None = None) -> None:
     )
     if task.error:
         with _PRELOAD_LOCK:
-            _CURRENT_PRELOAD = None
+            if _CURRENT_PRELOAD is task:
+                _CURRENT_PRELOAD = None
         raise task.error
-
-
-def preload_model(name: str) -> None:
-    """Синхронно прогреть модель со спиннером ожидания."""
-    run_with_spinner(
-        f"Загружаю {name}...",
-        lambda: generate(
-            model=name,
-            prompt="",
-            keep_alive=get_keep_alive(),
-            options={"num_ctx": get_context_tokens()},
-        ),
-    )
-    console.print(f"[green]✓[/green] [bold]{name}[/bold] готова.")
 
 
 def _normalize_model_tag(name: str) -> str:
@@ -244,8 +256,8 @@ def get_last_model(models: Sequence[str]) -> str | None:
     return models[0]
 
 
-def save_last_model(name: str) -> None:
+def save_last_model(name: str) -> bool:
     """Сохранить выбранную модель в пользовательский конфиг."""
     cfg = dict(load_user_config())
     cfg["default_model"] = name
-    save_user_config(cfg)
+    return save_user_config(cfg)

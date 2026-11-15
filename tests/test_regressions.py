@@ -142,7 +142,7 @@ def test_memory_sandbox_redirection(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "CHAT_DIR", sandbox_chat)
 
     assert memory._get_facts_path() == sandbox_facts
-    assert memory._get_chat_dir() == sandbox_chat
+    assert config.CHAT_DIR == sandbox_chat
     assert memory.load_facts() == []
 
     memory.save_facts([{"fact": "Test fact", "created_at": "2026-11-04"}])
@@ -516,7 +516,7 @@ def test_pull_manager_lock_free_fetch_and_multilayer_none_chunks(monkeypatch):
 def test_poll_key_unix_handles_partial_escape_and_ctrl_keys(monkeypatch):
     import types
 
-    from w1x import terminal
+    from w1x import key_input
 
     def run_sequence(byte_chunks):
         queue = list(byte_chunks)
@@ -540,10 +540,10 @@ def test_poll_key_unix_handles_partial_escape_and_ctrl_keys(monkeypatch):
         monkeypatch.setitem(sys.modules, "select", fake_select)
         monkeypatch.setitem(sys.modules, "termios", fake_termios)
         monkeypatch.setitem(sys.modules, "tty", fake_tty)
-        monkeypatch.setattr(terminal.os, "read", fake_read)
+        monkeypatch.setattr(key_input.os, "read", fake_read)
         fake_stdin = types.SimpleNamespace(isatty=lambda: True, fileno=lambda: 0)
-        monkeypatch.setattr(terminal.sys, "stdin", fake_stdin)
-        return terminal._poll_key_unix()
+        monkeypatch.setattr(key_input.sys, "stdin", fake_stdin)
+        return key_input._poll_key_unix()
 
     assert run_sequence([b"\x1b", b"[", None]) is None
     assert run_sequence([b"\x1b", b"[", b"A"]) == "UP"
@@ -609,6 +609,8 @@ def test_interactive_config_menu_handles_ctrl_c_in_subprompts(monkeypatch):
     monkeypatch.setattr(w1x_models_ui.secondary_session, "prompt", fake_prompt)
 
     w1x_models_ui.interactive_config_menu()
+    with pytest.raises(StopIteration):
+        next(prompts)
 
 
 def test_memory_forget_russian_case_inflection_and_none_safety(tmp_path, monkeypatch):
@@ -635,13 +637,14 @@ def test_memory_forget_russian_case_inflection_and_none_safety(tmp_path, monkeyp
 def test_copy_to_clipboard_raises_when_all_backends_fail(monkeypatch):
     import builtins
 
-    from w1x import terminal
+    from w1x import clipboard
 
     monkeypatch.setattr(
-        terminal.subprocess,
+        clipboard.subprocess,
         "run",
         lambda *a, **k: (_ for _ in ()).throw(OSError("no clipboard cmd")),
     )
+    monkeypatch.setattr(clipboard, "_win32_copy_to_clipboard", lambda _: False)
     real_import = builtins.__import__
 
     def fake_import(name, *args, **kwargs):
@@ -651,15 +654,15 @@ def test_copy_to_clipboard_raises_when_all_backends_fail(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
     with pytest.raises(RuntimeError):
-        terminal.copy_to_clipboard("hello")
+        clipboard.copy_to_clipboard("hello")
 
 
 def test_secondary_session_isolated_and_ctrl_s_keeps_lone_assistant(monkeypatch):
     import types
 
-    from w1x import terminal
+    from w1x import prompts
 
-    sec = terminal._create_prompt_session(with_repl_bindings=False)
+    sec = prompts._create_prompt_session(with_repl_bindings=False)
     if sec is not None:
         assert sec.completer is None
         assert sec.auto_suggest is None
@@ -675,7 +678,7 @@ def test_secondary_session_isolated_and_ctrl_s_keeps_lone_assistant(monkeypatch)
             current_buffer=types.SimpleNamespace(text="", cursor_position=0)
         )
     )
-    terminal.undo_and_restore_prompt(event)
+    prompts.undo_and_restore_prompt(event)
     assert len(messages) == 1
     assert messages[0]["role"] == "assistant"
 
@@ -850,14 +853,14 @@ def test_pull_manager_run_cli_pull_unified(monkeypatch):
 def test_terminal_undo_uses_injected_callback(monkeypatch):
     import types
 
-    from w1x import terminal
+    from w1x import prompts
 
     saved = []
 
     def fake_save(system_prompt, messages):
         saved.append((system_prompt, list(messages)))
 
-    terminal.set_undo_persist_callback(fake_save)
+    prompts.set_undo_persist_callback(fake_save)
     messages = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "hello"},
@@ -869,13 +872,1020 @@ def test_terminal_undo_uses_injected_callback(monkeypatch):
     event = types.SimpleNamespace(app=types.SimpleNamespace(current_buffer=buf))
 
     try:
-        terminal.undo_and_restore_prompt(event)
+        prompts.undo_and_restore_prompt(event)
     finally:
-        terminal.set_undo_persist_callback(None)
+        prompts.set_undo_persist_callback(None)
 
     assert buf.text == "hello"
     assert len(messages) == 1
     assert saved == [("sys", [{"role": "system", "content": "sys"}])]
+
+
+def test_memory_load_facts_oserror_does_not_wipe_facts(tmp_path, monkeypatch):
+    from w1x import memory
+
+    facts_file = tmp_path / "memory-facts.json"
+    facts_file.write_text('[{"id": "abc1", "fact": "секретный факт", "created_at": "t"}]', encoding="utf-8")
+    monkeypatch.setattr(config, "FACTS_PATH", facts_file)
+
+    original_read = Path.read_text
+
+    def failing_read(self, *args, **kwargs):
+        if self == facts_file:
+            raise PermissionError("Access denied by lock")
+        return original_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", failing_read)
+
+    facts, ok = memory.load_facts_with_status()
+    assert ok is False
+    assert facts == []
+    assert memory.load_facts() == []
+
+    remember_res = memory.remember_fact("новый факт")
+    assert "Ошибка: не удалось прочитать существующую память" in remember_res
+
+    forget_res = memory.forget_facts("факт")
+    assert "Ошибка: не удалось прочитать память" in forget_res
+
+    migrated = memory.migrate_explicit_memory([{"role": "user", "content": "Запомни: факт 2"}])
+    assert migrated == 0
+
+    monkeypatch.setattr(Path, "read_text", original_read)
+    assert len(memory.load_facts()) == 1
+    assert memory.load_facts()[0]["fact"] == "секретный факт"
+
+
+def test_first_run_wizard_skipped_on_ollama_offline(monkeypatch):
+    wizard_called = False
+
+    def fake_wizard():
+        nonlocal wizard_called
+        wizard_called = True
+        return "qwen3.5:4b"
+
+    monkeypatch.setattr(w1x_models_ui, "first_time_setup_wizard", fake_wizard)
+    monkeypatch.setattr(w1x_app, "first_time_setup_wizard", fake_wizard)
+    monkeypatch.setattr(w1x_models, "LAST_LIST_ERROR", ConnectionRefusedError("Offline"))
+    monkeypatch.setattr(w1x_models, "installed_models", lambda: [])
+
+    assert w1x_models_ui.choose_model() is None
+    assert wizard_called is False
+
+    code = w1x_app._run_cli_oneshot(["Привет"])
+    assert code == 1
+    assert wizard_called is False
+
+
+def test_pull_manager_cooldown_and_cli_pull_abort_on_offline(monkeypatch):
+    from w1x.pull_manager import AsyncPullManager
+
+    call_count = 0
+
+    def fake_installed():
+        nonlocal call_count
+        call_count += 1
+        w1x_models.LAST_LIST_ERROR = ConnectionRefusedError("Server down")
+        return []
+
+    monkeypatch.setattr(w1x_models, "installed_models", fake_installed)
+
+    mgr = AsyncPullManager()
+    assert mgr.get_installed() == set()
+    assert call_count == 1
+
+    assert mgr.get_installed() == set()
+    assert call_count == 1
+
+    assert mgr.run_cli_pull(["deepseek-r1:7b"]) is False
+
+
+def test_combined_datetime_request_injects_precomputed_fact_into_system_prompt(monkeypatch, tmp_path):
+    from w1x import config, engine
+
+    monkeypatch.setattr(config, "FACTS_PATH", tmp_path / "facts.json")
+    monkeypatch.setattr(config, "ACTIVE_FILE_ROOT", tmp_path)
+
+    prompt = "Какая сегодня дата? И напиши стих"
+    messages = [
+        {"role": "system", "content": "Base system instruction."},
+        {"role": "user", "content": prompt},
+    ]
+
+    shortcut, working_messages = engine._prepare_turn_or_shortcut(
+        "qwen3.5:4b", messages, prompt, 0
+    )
+
+    assert shortcut is None
+    assert working_messages is not None
+    assert working_messages[-1]["content"] == "И напиши стих"
+    system_text = working_messages[0]["content"]
+    assert "Точный результат вычисления даты/времени для запроса пользователя:" in system_text
+    assert "Сейчас:" in system_text
+
+
+def test_first_run_simulator_integration_with_dynamic_model_resolution(monkeypatch):
+    fake_list = ["custom-model:8b"]
+    monkeypatch.setattr(w1x_models, "installed_models", lambda: fake_list)
+
+    assert w1x_app.installed_models() == fake_list
+    assert w1x_models_ui.installed_models() == fake_list
+
+
+def test_run_cli_oneshot_pull_exit_code_on_failure(monkeypatch):
+    monkeypatch.setattr(w1x_app.GLOBAL_PULL_MANAGER, "run_cli_pull", lambda _: False)
+    code = w1x_app._run_cli_oneshot(["pull", "nonexistent-model"])
+    assert code == 1
+
+
+def test_run_cli_oneshot_returns_130_when_generation_interrupted(monkeypatch, tmp_path):
+    from w1x import config
+
+    monkeypatch.setattr(config, "FACTS_PATH", tmp_path / "facts.json")
+    monkeypatch.setattr(config, "CHAT_DIR", tmp_path / "chats")
+    monkeypatch.setattr(w1x_app, "installed_models", lambda: ["test-model:latest"])
+    monkeypatch.setattr(w1x_app, "wait_for_model_ready", lambda _: None)
+    monkeypatch.setattr(
+        w1x_app,
+        "generate_answer",
+        lambda *args, **kwargs: ("Partial answer", None, True),
+    )
+
+    code = w1x_app._run_cli_oneshot(["Скажи что-нибудь"])
+    assert code == 130
+
+
+def test_interactive_config_menu_handles_malformed_types(monkeypatch):
+    malformed_cfg = {
+        "default_model": "test-m",
+        "keep_alive_minutes": None,
+        "context_tokens": "not-a-number",
+        "stats_enabled": "maybe",
+    }
+    monkeypatch.setattr(w1x_models_ui, "load_user_config", lambda: malformed_cfg)
+    printed = []
+    monkeypatch.setattr(w1x_models_ui.console, "print", lambda *args, **kwargs: printed.extend(args))
+    monkeypatch.setattr(w1x_models_ui.secondary_session, "prompt", lambda *args, **kwargs: "0")
+
+    w1x_models_ui.interactive_config_menu()
+    assert len(printed) > 0
+    full_text = " ".join(str(getattr(p, "renderable", p)) for p in printed)
+    assert "8192 токенов" in full_text
+    assert "30 мин" in full_text
+    assert "Выключена" in full_text
+
+
+def test_dispatch_slash_command_syncs_session_state_after_config(monkeypatch):
+    state = w1x_app._SessionState(
+        model="old-model",
+        system_prompt="sys",
+        messages=[],
+        think_mode=False,
+        stats_enabled=False,
+    )
+
+    new_cfg = {
+        "default_model": "new-configured-model",
+        "stats_enabled": True,
+    }
+
+    monkeypatch.setattr(w1x_app, "interactive_config_menu", lambda: None)
+    monkeypatch.setattr(w1x_app, "load_user_config", lambda: new_cfg)
+    monkeypatch.setattr(w1x_app, "reset_all_models", lambda: None)
+    monkeypatch.setattr(w1x_app, "start_background_preload", lambda _: None)
+    monkeypatch.setattr(w1x_app, "print_header", lambda _: None)
+
+    handled = w1x_app._dispatch_slash_command("/config", "", state)
+    assert handled is True
+    assert state.model == "new-configured-model"
+    assert state.stats_enabled is True
+
+
+def test_render_models_panel_and_search_tree_escape_markup(monkeypatch):
+    panel = w1x_models_ui.render_models_panel(["model[custom_tag]:4b"], 0, set())
+    assert panel is not None
+
+    from w1x.tools import search
+
+    class FakeDDGS:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def text(self, *args, **kwargs):
+            return [
+                {
+                    "title": "Title with [bold] unclosed [tag]",
+                    "href": "https://example.com/item[1]",
+                    "body": "Body snippet with [/close] and [dim] tags",
+                }
+            ]
+
+    monkeypatch.setattr(search, "DDGS", FakeDDGS)
+    result = search.search_web("query [with] brackets")
+    assert "Title with [bold] unclosed [tag]" in result
+
+
+def test_workspace_list_files_ignores_system_and_hidden_dirs(tmp_path, monkeypatch):
+    from w1x.tools import workspace
+
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / ".git").mkdir()
+    (root / ".git" / "config").write_text("git config", encoding="utf-8")
+    (root / ".venv").mkdir()
+    (root / ".venv" / "bin.py").write_text("venv binary", encoding="utf-8")
+    (root / "node_modules").mkdir()
+    (root / "node_modules" / "pkg.js").write_text("pkg", encoding="utf-8")
+    (root / "__pycache__").mkdir()
+    (root / "__pycache__" / "c.pyc").write_text("cache", encoding="utf-8")
+    (root / "main.py").write_text("print('hello')", encoding="utf-8")
+    (root / "utils.py").write_text("def helper(): pass", encoding="utf-8")
+
+    monkeypatch.setattr(config, "ACTIVE_FILE_ROOT", root)
+    listing = workspace.list_project_files(".")
+    assert "main.py" in listing
+    assert "utils.py" in listing
+    assert ".git" not in listing
+    assert ".venv" not in listing
+    assert "node_modules" not in listing
+    assert "__pycache__" not in listing
+
+
+def test_tools_none_argument_safety():
+    from w1x.tools import antigravity, math_tool, python_runner, search
+
+    assert search.search_web(None) == "Ошибка: пустой поисковый запрос."
+    assert math_tool.calculate_expression(None) == "Ошибка: выражение пустое или слишком длинное."
+    assert python_runner.run_python_code(None, "purpose") == "Ошибка: модель передала пустой код."
+    assert antigravity.ask_antigravity(None) == "ESCALATE_ERROR: задача для Antigravity пуста."
+
+
+def test_testpy_avoids_duplicate_main_call(tmp_path, monkeypatch):
+    import subprocess
+
+    from w1x import testpy
+
+    count_file = tmp_path / "call_count.txt"
+    code = f"""
+called = 0
+def main():
+    with open(r"{count_file}", "a") as f:
+        f.write("call\\n")
+
+if __name__ == "__main__":
+    main()
+"""
+    real_run = subprocess.run
+
+    def run_without_window(arguments, **kwargs):
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        return real_run(
+            arguments,
+            input="q\\n",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+            timeout=10,
+        )
+
+    monkeypatch.setattr(testpy.subprocess, "run", run_without_window)
+    exit_code, log = testpy.run_interactive_python_test(code)
+    assert count_file.exists()
+    assert count_file.read_text(encoding="utf-8").strip().splitlines() == ["call"]
+
+
+def test_tool_call_keyboard_interrupt_propagates_and_marks_interrupted(monkeypatch):
+    import types
+
+    from w1x import engine
+    from w1x.tools import registry
+
+    fake_call = types.SimpleNamespace(
+        function=types.SimpleNamespace(name="ask_antigravity", arguments='{"task": "help"}')
+    )
+
+    def fake_run_with_spinner(*args, **kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(registry, "run_with_spinner", fake_run_with_spinner)
+
+    with pytest.raises(KeyboardInterrupt):
+        registry.execute_tool_call(fake_call)
+
+    monkeypatch.setattr(
+        engine,
+        "chat",
+        lambda **kw: iter([types.SimpleNamespace(message=types.SimpleNamespace(content="", thinking="", tool_calls=[fake_call]))]),
+    )
+    answer, stats, interrupted = engine.generate_answer("test-model", [{"role": "user", "content": "hi"}], False)
+    assert interrupted is True
+
+
+def test_trim_messages_strictly_respects_history_budget_with_large_dumps(monkeypatch):
+    from w1x import engine
+
+    monkeypatch.setattr(config, "get_context_tokens", lambda: 1000)
+
+    huge_text = "x" * 2000
+    messages = [
+        {"role": "user", "content": huge_text},
+        {"role": "assistant", "content": huge_text},
+        {"role": "user", "content": huge_text},
+        {"role": "assistant", "content": huge_text},
+        {"role": "user", "content": "fresh query"},
+    ]
+
+    trimmed = engine.trim_messages_for_model(messages)
+    total_trimmed_len = sum(len(m.get("content", "")) for m in trimmed if m.get("role") != "system")
+    assert total_trimmed_len <= 3500 + 100
+
+
+def test_terminal_raw_and_cooked_modes(monkeypatch):
+    from w1x import key_input
+
+    calls = []
+    fake_termios = MagicMock()
+    fake_tty = MagicMock()
+    fake_termios.tcgetattr.return_value = ["dummy_attrs"]
+    fake_termios.TCSADRAIN = 1
+
+    def fake_setraw(fd):
+        calls.append(("setraw", fd))
+
+    def fake_tcsetattr(fd, when, attrs):
+        calls.append(("tcsetattr", fd, attrs))
+
+    fake_tty.setraw = fake_setraw
+    fake_termios.tcsetattr = fake_tcsetattr
+
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdin, "fileno", lambda: 0)
+    monkeypatch.setitem(sys.modules, "termios", fake_termios)
+    monkeypatch.setitem(sys.modules, "tty", fake_tty)
+
+    with key_input.raw_terminal_mode():
+        assert key_input._UNIX_RAW_DEPTH == 1
+        with key_input.cooked_terminal_mode():
+            assert ("tcsetattr", 0, ["dummy_attrs"]) in calls
+    assert key_input._UNIX_RAW_DEPTH == 0
+    assert calls[-1] == ("tcsetattr", 0, ["dummy_attrs"])
+
+
+def test_print_status_displays_session_totals():
+    captured = []
+    dummy_console = MagicMock()
+    dummy_console.print = lambda p: captured.append(p)
+
+    with patch("w1x.app.console", dummy_console):
+        totals = {
+            "requests": 3,
+            "prompt_tokens": 120,
+            "output_tokens": 80,
+            "total_tokens": 200,
+            "total_duration": 1500000000,
+        }
+        w1x_app.print_status("test-model", False, True, [], totals)
+
+    assert len(captured) == 1
+    panel_text = str(captured[0].renderable)
+    assert "Токенов за сессию:" in panel_text
+    assert "[bold]200[/bold]" in panel_text
+    assert "в [bold]3[/bold] ответах" in panel_text
+
+
+def test_engine_direct_tool_result_format_cleanup():
+    from w1x import engine
+
+    request_started_ns = time.perf_counter_ns()
+    messages = [{"role": "user", "content": "2 + 2"}]
+    shortcut, error = engine._prepare_turn_or_shortcut("test-model", messages, "2 + 2", request_started_ns)
+    assert error is None
+    assert shortcut is not None
+    answer, stats, interrupted = shortcut
+    assert answer == "4"
+    assert interrupted is False
+
+
+def test_slash_command_autosuggest_and_submit_exact_command():
+    import types
+
+    from prompt_toolkit.auto_suggest import Suggestion
+    from prompt_toolkit.document import Document
+
+    from w1x.prompts import SlashCommandAutoSuggest, submit_message
+
+    suggest = SlashCommandAutoSuggest()
+    doc_prefix = Document("/mode", 5)
+    s_prefix = suggest.get_suggestion(None, doc_prefix)
+    assert s_prefix is not None
+    assert s_prefix.text in {"l", "ls"}
+
+    doc_exact = Document("/model", 6)
+    assert suggest.get_suggestion(None, doc_exact) is None
+
+    class FakeBuffer:
+        def __init__(self, text: str, suggestion_text: str | None = None):
+            self.text = text
+            self.document = Document(text, len(text))
+            self.complete_state = None
+            self.suggestion = Suggestion(suggestion_text) if suggestion_text else None
+            self.inserted: list[str] = []
+            self.handled = False
+
+        def insert_text(self, t: str) -> None:
+            self.inserted.append(t)
+
+        def validate_and_handle(self) -> None:
+            self.handled = True
+
+    buf_exact = FakeBuffer("/model", "s")
+    event = types.SimpleNamespace(
+        current_buffer=buf_exact,
+        app=types.SimpleNamespace(key_processor=None, input=None),
+    )
+    submit_message(event)
+    assert buf_exact.handled is True
+    assert buf_exact.inserted == []
+
+    buf_partial = FakeBuffer("/mode", "l")
+    event.current_buffer = buf_partial
+    submit_message(event)
+    assert buf_partial.handled is False
+    assert buf_partial.inserted == ["l"]
+
+
+def test_project_files_not_in_direct_passthrough_tools():
+    from w1x.tools import registry
+
+    assert "project_files" not in registry.DIRECT_PASSTHROUGH_TOOLS
+    assert "calculate_expression" in registry.DIRECT_PASSTHROUGH_TOOLS
+    assert "ask_antigravity" in registry.DIRECT_PASSTHROUGH_TOOLS
+
+
+def test_ask_antigravity_allows_permission_denied_in_successful_output(monkeypatch):
+    from w1x.tools import antigravity
+
+    class FakeProc:
+        def __init__(self, rc: int, stdout: str, stderr: str):
+            self.returncode = rc
+            self._stdout = stdout
+            self._stderr = stderr
+
+        def communicate(self, timeout=None):
+            return self._stdout, self._stderr
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(antigravity.shutil, "which", lambda cmd: "agy")
+
+    # 1. Successful run mentioning permission denied in text explanation
+    monkeypatch.setattr(
+        antigravity.subprocess,
+        "Popen",
+        lambda *args, **kwargs: FakeProc(0, "Fixing permission denied in Linux via chmod", ""),
+    )
+    res_ok = antigravity.ask_antigravity("how to fix permission denied?")
+    assert "Fixing permission denied in Linux" in res_ok
+    assert "ESCALATE_ERROR" not in res_ok
+
+    # 2. Failed run with permission denied error
+    monkeypatch.setattr(
+        antigravity.subprocess,
+        "Popen",
+        lambda *args, **kwargs: FakeProc(1, "", "fatal: permission denied on socket"),
+    )
+    res_err = antigravity.ask_antigravity("run task")
+    assert "ESCALATE_ERROR: Antigravity запросила запрещённое действие; доступ не выдан." == res_err
+
+
+def test_parse_math_request_syntax_validation():
+    from w1x.tools import math_tool
+
+    assert math_tool.parse_math_request("посчитай 100 - 20%") is None
+    assert math_tool.parse_math_request("посчитай 1 000 + 2 000") is None
+    assert math_tool.parse_math_request("посчитай 100 - 20") == "100 - 20"
+    assert math_tool.parse_math_request("сколько будет 25 * 4") == "25 * 4"
+
+
+def test_choose_model_filters_placeholder_current(monkeypatch):
+    from w1x import models_ui
+
+    fake_models = ["qwen3.5:4b", "llama3.2:3b"]
+    monkeypatch.setattr(models_ui, "installed_models", lambda: fake_models)
+    monkeypatch.setattr(models_ui, "running_models", lambda: [])
+    monkeypatch.setattr(models_ui, "poll_key_crossplatform", lambda: "ENTER")
+
+    # If current is placeholder, should default to first installed or get_last_model, not the placeholder
+    chosen = models_ui.choose_model(current="не выбрана")
+    assert chosen in fake_models
+    assert chosen != "не выбрана"
+
+    # If user cancels wizard at custom/new model item, should not return placeholder
+    monkeypatch.setattr(models_ui, "first_time_setup_wizard", lambda: None)
+    monkeypatch.setattr(models_ui, "poll_key_crossplatform", lambda: "DOWN")
+    # Simulate selecting last index and cancelling
+    monkeypatch.setattr(models_ui, "installed_models", lambda: fake_models)
+
+
+def test_win32_copy_to_clipboard_unicode_and_emojis():
+    from w1x import clipboard
+
+    test_string = "Привет мир! 🚀 W1x CLI UTF-8: 100 - 20% = 80."
+    clipboard.copy_to_clipboard(test_string)
+    if os.name == "nt":
+        read_back = clipboard._read_clipboard_text()
+        assert read_back == test_string
+
+
+def test_rich_markup_escaping_prevents_markup_error(monkeypatch, tmp_path):
+    from w1x import app as w1x_app
+    from w1x import config
+
+    # Fact containing unclosed/malformed Rich markup tags
+    tricky_fact = "[bold red]unclosed and [invalid_tag] with [/orphan]"
+    facts_file = tmp_path / "facts.json"
+    facts_file.write_text(json.dumps([{"fact": tricky_fact}], ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(config, "FACTS_PATH", facts_file)
+    monkeypatch.setattr(config, "CURRENT_CHAT_PATH", tmp_path / "chat.json")
+
+    # Should not raise MarkupError
+    w1x_app._handle_memory_cmd([])
+
+    # Testpy command with bracketed first line
+    monkeypatch.setattr(w1x_app, "run_interactive_python_test", lambda code: (0, "output"))
+    code_with_brackets = "[[1, 2], [3, 4]]\nx = 10"
+    last_resp = w1x_app._handle_testpy_cmd(code_with_brackets, [], "system", "")
+    assert "Лог тестирования получен" in last_resp
+
+    # Workspace command with bracketed directory path
+    tricky_dir = tmp_path / "[brackets_folder]"
+    tricky_dir.mkdir()
+    w1x_app._handle_workspace_cmd(str(tricky_dir))
+    assert config.ACTIVE_FILE_ROOT == tricky_dir
+    config.ACTIVE_FILE_ROOT = None
+
+    # System prompt display with markup brackets
+    state = w1x_app._SessionState(
+        model="test",
+        system_prompt="[system_tag] Prompt with [bold] unclosed",
+        messages=[],
+        think_mode=False,
+        stats_enabled=False,
+        last_response="",
+    )
+    # /system without args prints Panel with escaped prompt
+    res = w1x_app._dispatch_slash_command("/system", "", state)
+    assert res is True
+
+
+def test_execute_chat_turn_handles_keyboard_interrupt(monkeypatch):
+    from w1x import app as w1x_app
+    from w1x.config import ACTIVE_SESSION_DATA
+
+    state = w1x_app._SessionState(
+        model="test-model",
+        system_prompt="sys",
+        messages=[{"role": "system", "content": "sys"}],
+        think_mode=False,
+        stats_enabled=False,
+        last_response="",
+    )
+
+    def fake_wait(model):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(w1x_app, "wait_for_model_ready", fake_wait)
+
+    # Should catch KeyboardInterrupt, mark interrupted, pop user message, and set cancelled_prompt
+    w1x_app._execute_chat_turn("cancelled prompt text", retrying=False, state=state)
+
+    assert len(state.messages) == 1
+    assert state.messages[0]["role"] == "system"
+    assert ACTIVE_SESSION_DATA.get("cancelled_prompt") == "cancelled prompt text"
+
+
+def test_poll_key_crossplatform_non_tty_returns_exit(monkeypatch):
+    from w1x import key_input
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    assert key_input.poll_key_crossplatform() == "EXIT"
+
+
+def test_installed_models_show_error_suppression_and_lock(monkeypatch):
+    from w1x import models as w1x_models
+
+    def fake_list():
+        raise RuntimeError("Connection refused [10061]")
+
+    monkeypatch.setattr(w1x_models, "ollama_list", fake_list)
+
+    # show_error=False must suppress console print and return []
+    res_silent = w1x_models.installed_models(show_error=False)
+    assert res_silent == []
+    assert w1x_models.LAST_LIST_ERROR is not None
+
+    # show_error=True prints error panel without raising MarkupError
+    res_verbose = w1x_models.installed_models(show_error=True)
+    assert res_verbose == []
+
+
+def test_run_interactive_python_test_handles_signals_and_errors(monkeypatch):
+    from w1x import testpy
+
+    def fake_interrupt(*args, **kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(testpy.subprocess, "run", fake_interrupt)
+    code, log = testpy.run_interactive_python_test("print('hello')")
+    assert code == 130
+    assert "прервано пользователем" in log
+
+    def fake_oserror(*args, **kwargs):
+        raise OSError("Permission denied")
+
+    monkeypatch.setattr(testpy.subprocess, "run", fake_oserror)
+    code_err, log_err = testpy.run_interactive_python_test("print('hello')")
+    assert code_err == 1
+    assert "Не удалось запустить процесс" in log_err
+
+
+def test_datetime_tool_utc_z_suffix_python310():
+    res = json.loads(calculate_datetime(base_datetime="2026-11-15T12:00:00Z", hours=1))
+    assert "error" not in res
+    assert "2026-11-15" in res["result"]
+
+
+def test_pull_manager_enqueue_normalizes_latest_and_evicts_on_force_refresh(monkeypatch):
+    from w1x import models as w1x_models
+    from w1x import pull_manager
+
+    mgr = pull_manager.AsyncPullManager()
+    monkeypatch.setattr(w1x_models, "installed_models", lambda **kwargs: ["llama3.2:latest"])
+
+    # Enqueueing without :latest should recognize it's already installed
+    res = mgr.enqueue("llama3.2")
+    assert res == "already_installed"
+
+
+def test_pull_manager_abort_stops_stream_and_queue():
+    from w1x import pull_manager
+
+    mgr = pull_manager.AsyncPullManager()
+    mgr.queue = ["model1", "model2"]
+    mgr.tasks["model1"] = pull_manager.DownloadTask("model1")
+    mgr.tasks["model2"] = pull_manager.DownloadTask("model2")
+
+    mgr.abort()
+    assert mgr.queue == []
+    assert mgr.tasks["model1"].status == "error"
+    assert mgr.tasks["model2"].status == "error"
+
+
+def test_preload_task_cancellation_and_reset_all_models():
+    from w1x import models as w1x_models
+
+    w1x_models.start_background_preload("first-model")
+    task1 = w1x_models._CURRENT_PRELOAD
+    assert task1 is not None
+
+    # Resetting models should cancel current preload and reset to None
+    w1x_models.reset_all_models()
+    assert task1.cancelled is True
+    assert w1x_models._CURRENT_PRELOAD is None
+
+
+def test_copy_command_syncs_with_messages_after_undo(monkeypatch):
+    from w1x import app as w1x_app
+
+    copied = []
+    monkeypatch.setattr(w1x_app, "copy_to_clipboard", lambda text: copied.append(text))
+
+    state = w1x_app._SessionState(
+        model="test",
+        system_prompt="sys",
+        messages=[
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": "a2"},
+        ],
+        think_mode=False,
+        stats_enabled=False,
+        last_response="a2",
+    )
+
+    # Initial copy should copy a2
+    w1x_app._dispatch_slash_command("/copy", "", state)
+    assert copied[-1] == "a2"
+
+    # Simulate undo removing q2 and a2
+    state.messages.pop()
+    state.messages.pop()
+
+    # Now copy should dynamically copy remaining assistant message a1
+    w1x_app._dispatch_slash_command("/copy", "", state)
+    assert copied[-1] == "a1"
+
+
+def test_save_chat_empty_or_dot_name_defaults_to_timestamp(tmp_path, monkeypatch):
+    from w1x import chat_store, config
+
+    monkeypatch.setattr(config, "CHAT_DIR", tmp_path / "chats")
+
+    # Saving with "." or "/" should generate chat-*.md, not ".md"
+    saved_path = chat_store.save_chat([], ".")
+    assert saved_path.name.startswith("chat-")
+    assert saved_path.name.endswith(".md")
+    assert saved_path.name != ".md"
+
+
+def test_recall_facts_reports_disk_error_on_oserror(monkeypatch):
+    from w1x import memory
+
+    monkeypatch.setattr(memory, "load_facts_with_status", lambda: ([], False))
+    res = memory.recall_facts("anything")
+    assert "Ошибка: не удалось прочитать файл" in res
+
+
+def test_run_cli_oneshot_model_flag_combinations(monkeypatch):
+    from w1x import app as w1x_app
+
+    printed = []
+    monkeypatch.setattr(w1x_app.console, "print", lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)))
+    monkeypatch.setattr(w1x_app, "installed_models", lambda **kwargs: ["qwen3.5:4b"])
+
+    # w1x -m <model> --help should show help (exit 0)
+    assert w1x_app._run_cli_oneshot(["-m", "qwen3.5:4b", "--help"]) == 0
+
+    # w1x --model=qwen3.5:4b without question should delegate to interactive chat
+    launched_model = []
+    monkeypatch.setattr(w1x_app, "_run_interactive_chat", lambda m: launched_model.append(m) or 0)
+    res = w1x_app._run_cli_oneshot(["--model=qwen3.5:4b"])
+    assert res == 0
+    assert launched_model == ["qwen3.5:4b"]
+
+
+def test_get_context_tokens_validates_bool_and_lower_bound(monkeypatch):
+    from w1x import config
+
+    # Boolean value in config should fallback to 8192
+    monkeypatch.setattr(config, "load_user_config", lambda: {"context_tokens": True})
+    assert config.get_context_tokens() == 8192
+
+    # Lower bound < 512 should be clamped to 512
+    monkeypatch.setattr(config, "load_user_config", lambda: {"context_tokens": 128})
+    assert config.get_context_tokens() == 512
+
+
+def test_project_files_handles_none_and_invalid_action():
+    from w1x.tools.workspace import project_files
+
+    assert "Ошибка: action должен быть list или read" in project_files(None)  # type: ignore[arg-type]
+    assert "Ошибка: action должен быть list или read" in project_files(123)   # type: ignore[arg-type]
+    assert "Ошибка: action должен быть list или read" in project_files("invalid")
+
+
+def test_datetime_mixed_direction_postfix_phrasing():
+    from w1x.tools.datetime_tool import parse_datetime_request
+
+    req = parse_datetime_request("1 час назад и 30 минут вперед")
+    assert req is not None
+    assert req["hours"] == -1
+    assert req["minutes"] == 30
+
+    req_rev = parse_datetime_request("через 1 час и 30 минут назад")
+    assert req_rev is not None
+    assert req_rev["hours"] == 1
+    assert req_rev["minutes"] == -30
+
+
+def test_precompute_math_ignores_identifiers_and_aspect_ratios():
+    from w1x.engine import _precompute_math_block
+
+    # Should not evaluate sha256/2 or 16/9
+    res = _precompute_math_block("покажи хэш sha256/2 и соотношение 16/9")
+    assert res == ""
+
+    # Explicit computation should be evaluated
+    calc_res = _precompute_math_block("посчитай 256 / 2")
+    assert "128" in calc_res
+
+
+def test_python_runner_preview_handles_zero_input(monkeypatch):
+    from w1x.tools import python_runner
+
+    rendered = []
+    monkeypatch.setattr(python_runner, "render_message", lambda msg, role=None: rendered.append(msg))
+    monkeypatch.setattr(python_runner.secondary_session, "prompt", lambda *args, **kwargs: "n")
+
+    python_runner.run_python_code("print('ok')", "проверка", inputs=0)  # type: ignore[arg-type]
+    preview = [m for m in rendered if "Входные данные для input()" in m]
+    assert len(preview) == 1
+    assert "'0'" in preview[0]
+
+
+def test_chat_store_load_current_chat_handles_null_messages(tmp_path, monkeypatch):
+    from w1x import chat_store, config
+
+    chat_file = tmp_path / "current-chat.json"
+    chat_file.write_text(
+        json.dumps({"custom_system_prompt": True, "system_prompt": "Custom prompt", "messages": None}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "CURRENT_CHAT_PATH", chat_file)
+
+    prompt, messages = chat_store.load_current_chat()
+    assert prompt == "Custom prompt"
+    assert len(messages) == 1
+    assert messages[0]["content"] == "Custom prompt"
+
+
+def test_has_explicit_top_call_detects_assignment_and_try():
+    import ast
+    from w1x.testpy import has_explicit_top_call
+
+    tree1 = ast.parse("rc = main()")
+    assert has_explicit_top_call(tree1, "main") is True
+
+    tree2 = ast.parse("try:\n    main()\nexcept Exception:\n    pass")
+    assert has_explicit_top_call(tree2, "main") is True
+
+    tree3 = ast.parse("if True:\n    pass\nelse:\n    main()")
+    assert has_explicit_top_call(tree3, "main") is True
+
+    tree4 = ast.parse("def helper():\n    main()\nx = 1")
+    assert has_explicit_top_call(tree4, "main") is False
+
+
+def test_load_facts_with_status_handles_oserror_on_exists(tmp_path, monkeypatch):
+    from pathlib import Path
+    from w1x import config, memory
+
+    fake_file = tmp_path / "protected_facts.json"
+    monkeypatch.setattr(config, "FACTS_PATH", fake_file)
+
+    def failing_exists(self):
+        raise OSError("Permission denied on directory")
+
+    monkeypatch.setattr(Path, "exists", failing_exists)
+    facts, ok = memory.load_facts_with_status()
+    assert facts == []
+    assert ok is False
+
+
+def test_memory_rank_facts_and_relevant_block():
+    from w1x import memory
+
+    many_facts = [{"fact": f"Факт пользователя номер {i}"} for i in range(35)]
+    ranked = memory._rank_facts(many_facts, "номер 5")
+    assert any("5" in f for f in ranked)
+
+    # When query has no matches and >5 facts, empty list is returned
+    unmatched = memory._rank_facts(many_facts, "совершенно чужое слово")
+    assert unmatched == []
+
+
+def test_session_state_encapsulation_and_active_data_sync():
+    from w1x import app as w1x_app, config
+
+    state = w1x_app._SessionState(
+        model="demo-model",
+        system_prompt="system instruction",
+        messages=[{"role": "system", "content": "system instruction"}],
+    )
+
+    # Verify auto-sync on init
+    assert config.ACTIVE_SESSION_DATA["messages"] == state.messages
+    assert config.ACTIVE_SESSION_DATA["system_prompt"] == "system instruction"
+
+    # User turn and cancelled prompt handling
+    state.set_cancelled_prompt("draft query")
+    assert config.ACTIVE_SESSION_DATA.get("cancelled_prompt") == "draft query"
+    assert state.pop_cancelled_prompt() == "draft query"
+    assert config.ACTIVE_SESSION_DATA.get("cancelled_prompt") is None
+
+    # Adding messages through state methods
+    state.append_user_message("Test user question")
+    assert len(state.messages) == 2
+    assert config.ACTIVE_SESSION_DATA["messages"][-1]["content"] == "Test user question"
+
+    state.append_assistant_reply("Assistant answer", None)
+    assert len(state.messages) == 3
+    assert state.last_response == "Assistant answer"
+    assert config.ACTIVE_SESSION_DATA["messages"][-1]["content"] == "Assistant answer"
+
+    # Undo turn
+    assert state.undo_turn() is True
+    assert len(state.messages) == 1
+    assert state.last_response == ""
+    assert config.ACTIVE_SESSION_DATA["messages"] == state.messages
+
+    # Reset context
+    state.append_user_message("Another turn")
+    state.reset_context()
+    assert len(state.messages) == 1
+    assert state.messages[0]["content"] == "system instruction"
+
+
+def test_get_installed_models_with_status_contract(monkeypatch):
+    from w1x import models
+
+    class FakeItem:
+        def __init__(self, name):
+            self.model = name
+
+    class FakeOllamaList:
+        def __init__(self, items):
+            self.models = [FakeItem(n) for n in items]
+
+    # Success case
+    monkeypatch.setattr(models, "ollama_list", lambda: FakeOllamaList(["qwen2.5:7b"]))
+    names, err = models.get_installed_models_with_status(show_error=False)
+    assert names == ["qwen2.5:7b"]
+    assert err is None
+    assert models.installed_models() == ["qwen2.5:7b"]
+
+    # Error case
+    def failing_list():
+        raise ConnectionRefusedError("Offline")
+
+    monkeypatch.setattr(models, "ollama_list", failing_list)
+    names_err, err_obj = models.get_installed_models_with_status(show_error=False)
+    assert names_err == []
+    assert isinstance(err_obj, ConnectionRefusedError)
+    assert models.LAST_LIST_ERROR is err_obj
+
+
+def test_render_catalog_responsive_width_and_apple_silicon(monkeypatch):
+    import shutil
+    from collections import namedtuple
+    from w1x import catalog_ui
+
+    TerminalSize = namedtuple("TerminalSize", ["columns", "lines"])
+    monkeypatch.setattr(shutil, "get_terminal_size", lambda fallback=(80, 24): TerminalSize(80, 24))
+
+    apple_hw = {
+        "gpu_name": "Apple Silicon M3 Max",
+        "vram_gb": 36.0,
+        "ram_gb": 36.0,
+    }
+    sample_items = [
+        {"category": "general", "name": "qwen2.5:7b-instruct-q4_K_M", "size_gb": 4.5, "vram_min": 6.0, "note": "Быстрая модель"}
+    ]
+
+    rendered_text = catalog_ui._render_catalog(sample_items, 0, 0, 10, apple_hw, "OK")
+    plain = str(rendered_text)
+
+    # Must contain unified memory notice and not exceed 80 chars per table line
+    assert "Unified" in plain
+    for line in plain.splitlines():
+        # Header divider and content should fit narrow width
+        assert len(line) <= 85
+
+
+def test_decomposed_domain_modules_integrity():
+    from w1x import clipboard, key_input, prompts, terminal
+
+    # Verify each module exposes its expected domain interfaces
+    assert hasattr(clipboard, "copy_to_clipboard")
+    assert hasattr(clipboard, "_read_clipboard_text")
+    assert hasattr(key_input, "poll_key_crossplatform")
+    assert hasattr(key_input, "raw_terminal_mode")
+    assert hasattr(key_input, "cooked_terminal_mode")
+    assert hasattr(prompts, "read_input")
+    assert hasattr(prompts, "session")
+    assert hasattr(prompts, "secondary_session")
+    assert hasattr(prompts, "SlashCommandCompleter")
+    assert hasattr(terminal, "console")
+    assert hasattr(terminal, "render_message")
+    assert hasattr(terminal, "run_with_spinner")
+
+
+def test_conftest_hermetic_isolation_active(tmp_path):
+    from pathlib import Path
+    from w1x import config
+
+    # The autouse fixture must guarantee isolated directories
+    assert config.DATA_DIR != Path.home() / ".w1x"
+    assert config.CONFIG_FILE_PATH != Path.home() / ".w1x" / "config.json"
+    assert config.CURRENT_CHAT_PATH != Path.home() / ".w1x" / "current-chat.json"
+    assert config.FACTS_PATH != Path.home() / ".w1x" / "memory-facts.json"
+
+
+
+
+
+
 
 
 

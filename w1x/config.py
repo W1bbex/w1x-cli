@@ -8,6 +8,8 @@ from typing import Any
 from .types import UserConfig
 
 logger = logging.getLogger("w1x")
+if not logger.handlers:
+    logger.addHandler(logging.NullHandler())
 
 APP_VERSION = "3.5.1"
 EXIT_COMMANDS = {"q", "/q", "quit", "/quit", "exit", "/exit"}
@@ -86,8 +88,12 @@ def get_keep_alive() -> str:
 
 
 def get_context_tokens() -> int:
+    val = load_user_config().get("context_tokens", 8192)
+    if isinstance(val, bool):
+        return 8192
     try:
-        return int(load_user_config().get("context_tokens", 8192))
+        tokens = int(val)
+        return max(512, tokens)
     except Exception:
         return 8192
 

@@ -1,7 +1,22 @@
 """Безопасное чтение файлов в рамках выбранной папки проекта."""
+import os
 from pathlib import Path
 
 from .. import config
+
+_EXCLUDED_WORKSPACE_DIRS = {
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".pytest_cache",
+    ".idea",
+    ".vscode",
+    ".tox",
+}
 
 
 def set_file_workspace(path_text: str) -> Path:
@@ -42,14 +57,23 @@ def list_project_files(relative_path: str = ".") -> str:
     if not directory.exists() or not directory.is_dir():
         return "Ошибка: папка не существует."
     files = []
-    for path in directory.rglob("*"):
-        try:
-            resolved = path.resolve(strict=True)
-            resolved.relative_to(root)
-        except (OSError, ValueError):
-            continue
-        if path.is_file():
-            files.append(str(path.relative_to(root)))
+    for root_dir, dirnames, filenames in os.walk(str(directory)):
+        dirnames[:] = [
+            d for d in sorted(dirnames)
+            if d not in _EXCLUDED_WORKSPACE_DIRS and not d.startswith(".")
+        ]
+        dir_path = Path(root_dir)
+        for fname in sorted(filenames):
+            file_path = dir_path / fname
+            try:
+                resolved = file_path.resolve(strict=True)
+                resolved.relative_to(root)
+            except (OSError, ValueError):
+                continue
+            if resolved.is_file():
+                files.append(str(resolved.relative_to(root)))
+            if len(files) >= 200:
+                break
         if len(files) >= 200:
             break
     if not files:
@@ -84,9 +108,9 @@ def read_project_file(relative_path: str) -> str:
 
 def project_files(action: str, path: str = ".") -> str:
     """Просмотреть файлы проекта: действие list или read."""
-    action = action.strip().casefold()
-    if action == "list":
+    action_clean = str(action or "").strip().casefold()
+    if action_clean == "list":
         return list_project_files(path)
-    if action == "read":
+    if action_clean == "read":
         return read_project_file(path)
     return "Ошибка: action должен быть list или read."

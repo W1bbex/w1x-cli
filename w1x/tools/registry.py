@@ -25,14 +25,8 @@ TOOL_FUNCTIONS: list[Callable[..., Any]] = list(AVAILABLE_TOOLS.values())
 
 DIRECT_PASSTHROUGH_TOOLS = {
     "calculate_expression",
-    "project_files",
     "ask_antigravity",
 }
-
-
-def format_direct_tool_result(name: str, result: str) -> str:
-    """Форматировать результат инструмента для прямой выдачи пользователю."""
-    return result
 
 
 def execute_tool_call(call: Any) -> str:
@@ -72,6 +66,6 @@ def execute_tool_call(call: Any) -> str:
             )
         return str(function(**arguments))
     except KeyboardInterrupt:
-        return "Вызов инструмента остановлен пользователем."
+        raise
     except Exception as error:
         return f"Ошибка инструмента {name}: {type(error).__name__}: {error}"

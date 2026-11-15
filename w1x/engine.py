@@ -38,7 +38,6 @@ from .tools.registry import (
     DIRECT_PASSTHROUGH_TOOLS,
     TOOL_FUNCTIONS,
     execute_tool_call,
-    format_direct_tool_result,
 )
 from .types import ChatMessage, StatsRecord
 
@@ -58,12 +57,17 @@ def trim_messages_for_model(
     total_chars = 0
     selected: list[dict[str, Any]] = []
     max_history = get_max_history_chars()
-    # Всегда гарантированно сохраняем хотя бы последние 6 сообщений диалога
+    # Всегда гарантированно сохраняем последнюю пару реплик (idx < 2).
+    # Для предыдущих реплик строго соблюдаем общий бюджет символов max_history.
     for idx, item in enumerate(reversed(conversation)):
-        content_len = len(item["content"])
-        if idx >= 6 and (total_chars + content_len > max_history):
+        content = item["content"]
+        content_len = len(content)
+        if idx >= 2 and (total_chars + content_len > max_history):
             break
-        selected.append({"role": item["role"], "content": item["content"]})
+        if idx < 2 and max_history > 0 and content_len > max_history:
+            content = content[-max_history:]
+            content_len = len(content)
+        selected.append({"role": item["role"], "content": content})
         total_chars += content_len
 
     selected.reverse()
@@ -103,9 +107,14 @@ def _precompute_math_block(last_user_text: str) -> str:
         )
     )
     normalized_text = last_user_text.replace("×", "*").replace("÷", "/")
-    math_candidates = re.findall(r"[\d\s().,+\-*/%]{3,}", normalized_text)
+    math_candidates = re.findall(
+        r"(?<![a-zA-Z0-9_])[\d\s().,+\-*/%]{3,}(?![a-zA-Z0-9_])",
+        normalized_text,
+    )
     for cand in math_candidates:
         cand_clean = cand.strip(" ,.")
+        if not has_explicit_math_intent and cand_clean in {"16/9", "4/3", "21/9", "3/2", "1/1"}:
+            continue
         if re.search(r"\b\d{4}-\d{1,2}-\d{1,2}\b", cand_clean) or re.search(
             r"\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b", cand_clean
         ):
@@ -143,7 +152,10 @@ def _precompute_math_block(last_user_text: str) -> str:
 
 
 def _build_runtime_system_prompt(
-    model: str, base_prompt: str, last_user_text: str
+    model: str,
+    base_prompt: str,
+    last_user_text: str,
+    precomputed_datetime: str | None = None,
 ) -> str:
     """Собрать системный промпт с текущей датой, правилами и памятью."""
     now_dt = datetime.now()
@@ -154,6 +166,13 @@ def _build_runtime_system_prompt(
     )
     memory_block = relevant_memory_block(last_user_text)
     math_pre_block = _precompute_math_block(last_user_text)
+    datetime_pre_block = (
+        f"Точный результат вычисления даты/времени для запроса пользователя:\n"
+        f"- {precomputed_datetime}\n"
+        f"Обязательно включи этот точный факт в свой ответ."
+        if precomputed_datetime
+        else ""
+    )
     return (
         f"{base_prompt}\n\n"
         f"Сейчас внутри W1x работает базовая модель Ollama: {model}. "
@@ -162,6 +181,7 @@ def _build_runtime_system_prompt(
         f"{TOOL_INSTRUCTIONS}\n\n{FORMAT_INSTRUCTIONS}"
         + (f"\n\n{memory_block}" if memory_block else "")
         + (f"\n\n{math_pre_block}" if math_pre_block else "")
+        + (f"\n\n{datetime_pre_block}" if datetime_pre_block else "")
     )
 
 
@@ -189,7 +209,7 @@ def _prepare_turn_or_shortcut(
         math_expression = previous_math_expression(messages[:-1])
     if math_expression is not None:
         result = calculate_expression(math_expression)
-        answer = format_direct_tool_result("calculate_expression", result)
+        answer = result
         console.print()
         render_message("ИИ ›", role="assistant_label")
         console.print()
@@ -210,7 +230,9 @@ def _prepare_turn_or_shortcut(
         return (answer, direct_tool_stats("calculate_datetime", request_started_ns), False), None
 
     working_messages = trim_messages_for_model(messages)
+    precomputed_datetime: str | None = None
     if datetime_arguments is not None and remaining_request:
+        precomputed_datetime = datetime_answer(datetime_arguments)
         for message in reversed(working_messages):
             if message.get("role") == "user":
                 message["content"] = remaining_request
@@ -219,6 +241,7 @@ def _prepare_turn_or_shortcut(
         model,
         working_messages[0]["content"],
         last_user_text,
+        precomputed_datetime=precomputed_datetime,
     )
     return None, working_messages
 
@@ -509,17 +532,22 @@ def generate_answer(
             break
         tool_rounds_used += 1
 
-        round_tool_results = _execute_tool_batch(
-            tool_calls, working_messages, compact_tool_results
-        )
+        try:
+            round_tool_results = _execute_tool_batch(
+                tool_calls, working_messages, compact_tool_results
+            )
+        except KeyboardInterrupt:
+            return "Отменено пользователем.", finalize_stats(aggregate_stats, request_started_ns), True
         if round_tool_results:
             tools_used = True
-        if round_tool_results and all(
-            name in DIRECT_PASSTHROUGH_TOOLS for name, _ in round_tool_results
+        if (
+            tool_rounds_used == 1
+            and round_tool_results
+            and all(name in DIRECT_PASSTHROUGH_TOOLS for name, _ in round_tool_results)
         ):
             answer = "\n\n".join(
-                format_direct_tool_result(name, result)
-                for name, result in round_tool_results
+                result
+                for _, result in round_tool_results
             )
             console.print()
             label = (

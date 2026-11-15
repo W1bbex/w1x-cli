@@ -91,7 +91,7 @@ def calculate_expression(expression: str) -> str:
     Returns:
         Точный результат вычисления или описание ошибки.
     """
-    expression = expression.strip()
+    expression = str("" if expression is None else expression).strip()
     if not expression or len(expression) > 300:
         return "Ошибка: выражение пустое или слишком длинное."
     try:
@@ -144,6 +144,11 @@ def parse_math_request(text: str) -> str | None:
     remaining = normalized.replace(raw_best, " ")
     words = set(re.findall(r"[a-zа-яё]+", remaining))
     if words and not words <= _MATH_ALLOWED_WORDS:
+        return None
+    try:
+        tree = ast.parse(expression, mode="eval")
+        _evaluate_math_node(tree, expression)
+    except Exception:
         return None
     return expression
 

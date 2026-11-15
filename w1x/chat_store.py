@@ -17,8 +17,10 @@ def save_chat(messages: Sequence[ChatMessage], requested_name: str = "") -> Path
     """Экспортировать историю диалога в Markdown-файл."""
     config.CHAT_DIR.mkdir(parents=True, exist_ok=True)
     if requested_name:
-        safe_name = Path(requested_name).name
-        if not safe_name.lower().endswith(".md"):
+        safe_name = Path(requested_name).name.strip()
+        if safe_name.strip(" .") == "":
+            safe_name = datetime.now().strftime("chat-%Y-%m-%d-%H%M%S.md")
+        elif not safe_name.lower().endswith(".md"):
             safe_name += ".md"
     else:
         safe_name = datetime.now().strftime("chat-%Y-%m-%d-%H%M%S.md")
@@ -98,7 +100,10 @@ def load_current_chat() -> tuple[str, list[ChatMessage]]:
             and saved_system_prompt != config.DEFAULT_SYSTEM_PROMPT
         )
 
-        for message in ([] if discard_legacy_style else state.get("messages", [])):
+        raw_messages = state.get("messages")
+        message_list = raw_messages if isinstance(raw_messages, list) else []
+
+        for message in ([] if discard_legacy_style else message_list):
             if not isinstance(message, dict):
                 continue
             role = message.get("role")

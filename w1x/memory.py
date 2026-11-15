@@ -16,9 +16,6 @@ def _get_facts_path() -> Path | None:
     return getattr(config, "FACTS_PATH", None)
 
 
-def _get_chat_dir() -> Path | None:
-    return getattr(config, "CHAT_DIR", None)
-
 _MEMORY_STOPWORDS = {
     "а", "в", "вы", "где", "для", "его", "ее", "и", "как", "какая",
     "какой", "кто", "мне", "мой", "моя", "мое", "моё", "на", "называется",
@@ -36,12 +33,14 @@ _GENERAL_MEMORY_PATTERNS = (
 )
 
 
-def load_facts() -> list[MemoryFact]:
-    """Загрузить отдельную постоянную память фактов."""
+def load_facts_with_status() -> tuple[list[MemoryFact], bool]:
+    """Загрузить отдельную постоянную память фактов с признаком успешности чтения."""
     facts_p = _get_facts_path()
-    if not facts_p or not facts_p.exists():
-        return []
+    if not facts_p:
+        return [], True
     try:
+        if not facts_p.exists():
+            return [], True
         payload = json.loads(facts_p.read_text(encoding="utf-8"))
     except (ValueError, TypeError):
         try:
@@ -52,18 +51,24 @@ def load_facts() -> list[MemoryFact]:
                 facts_p.unlink(missing_ok=True)
             except Exception:
                 pass
-        return []
+        return [], True
     except OSError:
-        return []
+        return [], False
     if not isinstance(payload, list):
-        return []
+        return [], True
     return [
         item  # type: ignore[misc]
         for item in payload
         if isinstance(item, dict)
         and isinstance(item.get("fact"), str)
         and item["fact"].strip()
-    ]
+    ], True
+
+
+def load_facts() -> list[MemoryFact]:
+    """Загрузить отдельную постоянную память фактов."""
+    facts, _ = load_facts_with_status()
+    return facts
 
 
 def save_facts(facts: Sequence[MemoryFact]) -> bool:
@@ -103,7 +108,9 @@ def remember_fact(fact: str) -> str:
     if len(fact) > 500:
         return "Ошибка: один факт не должен быть длиннее 500 символов."
 
-    facts = load_facts()
+    facts, ok = load_facts_with_status()
+    if not ok:
+        return "Ошибка: не удалось прочитать существующую память (файл заблокирован)."
     normalized = fact.casefold()
     for item in facts:
         if item["fact"].casefold() == normalized:
@@ -127,7 +134,7 @@ def _stem_word(word: str) -> str:
         return w
     for suffix in (
         "ами", "ями", "ого", "его", "ому", "ему", "ыми", "ими", "ах", "ях",
-        "ов", "ев", "ей", "ом", "ем", "ам", "ям", "ой", "ей", "ий", "ый",
+        "ов", "ев", "ей", "ом", "ем", "ам", "ям", "ой", "ий", "ый",
         "ая", "яя", "ое", "ее", "ые", "ие", "ут", "ют", "ат", "ят", "ил",
         "ила", "или", "ит", "ет", "у", "ю", "а", "я", "е", "ы", "и", "о",
     ):
@@ -139,7 +146,7 @@ def _stem_word(word: str) -> str:
 def _memory_words(text: str) -> set[str]:
     words = set()
     safe_text = "" if text is None else str(text)
-    for raw in re.findall(r"[a-zа-яё0-9_-]{2,}", safe_text.casefold()):
+    for raw in re.findall(r"[a-zа-яё_-]{2,}|\d+", safe_text.casefold()):
         if raw not in _MEMORY_STOPWORDS:
             stem = _stem_word(raw)
             if stem:
@@ -154,6 +161,34 @@ def _is_general_query(query: str) -> bool:
     return any(re.search(pat, q) for pat in _GENERAL_MEMORY_PATTERNS)
 
 
+def _rank_facts(facts: Sequence[MemoryFact], safe_query: str) -> list[str]:
+    """Ранжировать факты по релевантности запросу."""
+    if not facts:
+        return []
+    if _is_general_query(safe_query):
+        return [item["fact"] for item in facts[-20:]]
+
+    query_words = _memory_words(safe_query)
+    ranked = []
+    for index, item in enumerate(facts):
+        fact_words = _memory_words(item["fact"])
+        overlap = len(query_words & fact_words)
+        if not overlap:
+            for qw in query_words:
+                if len(qw) >= 3 and any(qw in fw or fw in qw for fw in fact_words):
+                    overlap += 1
+        if overlap:
+            ranked.append((overlap, index, item["fact"]))
+
+    if not ranked:
+        if len(facts) <= 5:
+            return [item["fact"] for item in facts]
+        return []
+
+    ranked.sort(reverse=True)
+    return [fact for _, _, fact in ranked[:8]]
+
+
 def recall_facts(query: str = "") -> str:
     """Найти факты в постоянной памяти W1x.
 
@@ -164,40 +199,18 @@ def recall_facts(query: str = "") -> str:
         Найденные факты или сообщение, что совпадений нет.
     """
     safe_query = "" if query is None else str(query)
-    facts = load_facts()
+    facts, ok = load_facts_with_status()
+    if not ok:
+        return "Ошибка: не удалось прочитать файл постоянной памяти с диска."
     if not facts:
         return "Постоянная память фактов пуста."
 
-    if _is_general_query(safe_query):
-        return "Факты из постоянной памяти:\n" + "\n".join(
-            f"- {item['fact']}" for item in facts[-20:]
-        )
-
-    query_words = _memory_words(safe_query)
-    ranked = []
-    for index, item in enumerate(facts):
-        fact_words = _memory_words(item["fact"])
-        overlap = len(query_words & fact_words)
-        # Также проверяем частичные подстроки
-        if not overlap:
-            for qw in query_words:
-                if len(qw) >= 3 and any(qw in fw or fw in qw for fw in fact_words):
-                    overlap += 1
-        if overlap:
-            ranked.append((overlap, index, item["fact"]))
-
-    if not ranked:
-        # Если точных совпадений нет, но фактов мало (до 5) — возвращаем их
-        if len(facts) <= 5:
-            return "Факты из постоянной памяти:\n" + "\n".join(
-                f"- {item['fact']}" for item in facts
-            )
+    matched = _rank_facts(facts, safe_query)
+    if not matched:
         return "В постоянной памяти нет подходящего факта."
 
-    ranked.sort(reverse=True)
-    selected = [fact for _, _, fact in ranked[:8]]
     return "Факты из постоянной памяти:\n" + "\n".join(
-        f"- {fact}" for fact in selected
+        f"- {fact}" for fact in matched
     )
 
 
@@ -213,7 +226,9 @@ def forget_facts(query: str) -> str:
     query_words = _memory_words(query)
     if not query_words:
         return "Ошибка: уточни, какой факт забыть."
-    facts = load_facts()
+    facts, ok = load_facts_with_status()
+    if not ok:
+        return "Ошибка: не удалось прочитать память (файл заблокирован)."
     kept = []
     removed = []
     for item in facts:
@@ -261,8 +276,13 @@ def relevant_memory_block(query: str = "") -> str:
         return "Факты из постоянной памяти о пользователе:\n" + "\n".join(
             f"- {item['fact']}" for item in facts
         )
-    recalled = recall_facts(query)
-    return "" if recalled.endswith("пуста.") or "нет подходящего" in recalled else recalled
+    safe_query = "" if query is None else str(query)
+    matched = _rank_facts(facts, safe_query)
+    if not matched:
+        return ""
+    return "Факты из постоянной памяти о пользователе:\n" + "\n".join(
+        f"- {fact}" for fact in matched
+    )
 
 
 def extract_remember_request(text: str) -> str:
@@ -295,7 +315,9 @@ def looks_like_memory_question(text: str) -> bool:
 
 def migrate_explicit_memory(messages: Sequence[ChatMessage]) -> int:
     """Один раз подобрать старые фразы «запомни» из сохранённого диалога."""
-    facts = load_facts()
+    facts, ok = load_facts_with_status()
+    if not ok:
+        return 0
     existing = {item["fact"].casefold() for item in facts}
     migrated = 0
     for message in messages:

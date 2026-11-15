@@ -12,7 +12,15 @@ from rich.text import Text
 from .config import load_user_config, save_user_config
 from .hardware import classify_model_fit, detect_hardware
 from .pull_manager import GLOBAL_PULL_MANAGER
-from .terminal import HTML, console, poll_key_crossplatform, secondary_session
+from prompt_toolkit.formatted_text import HTML
+
+from .key_input import (
+    cooked_terminal_mode,
+    poll_key_crossplatform,
+    raw_terminal_mode,
+)
+from .prompts import secondary_session
+from .terminal import console
 from .types import HardwareInfo
 
 
@@ -295,6 +303,13 @@ def _render_catalog(
     installed_set = GLOBAL_PULL_MANAGER.get_installed()
     total = len(items)
 
+    term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+    is_narrow = term_cols < 96
+    name_col_w = 26 if is_narrow else 38
+    mem_header = "Память" if is_narrow else "Потребление памяти"
+    mem_col_w = 10 if is_narrow else 18
+    divider_len = min(86, max(60, term_cols - 2))
+
     t = Text()
 
     if is_apple_silicon:
@@ -304,12 +319,12 @@ def _render_catalog(
             f" Видеокарта: {gpu_name}   VRAM: {vram_gb} GB (доступно ~{effective_vram:.0f} GB)   RAM: {ram_gb} GB\n",
             style="dim",
         )
-    t.append(" " + chr(0x2500) * 86 + "\n", style="dim")
+    t.append(" " + chr(0x2500) * divider_len + "\n", style="dim")
     t.append(
-        f"  {'№':>2}  {'Модель':<38}  {'Вес':>8}   {'Потребление памяти':>18}   {'Статус':<15} [{cursor+1}/{total}]\n",
+        f"  {'№':>2}  {'Модель':<{name_col_w}}  {'Вес':>8}   {mem_header:>{mem_col_w}}   {'Статус':<15} [{cursor+1}/{total}]\n",
         style="dim",
     )
-    t.append(" " + chr(0x2500) * 86 + "\n", style="dim")
+    t.append(" " + chr(0x2500) * divider_len + "\n", style="dim")
 
     if scroll_offset > 0:
         t.append(f"      ▲  ... еще {scroll_offset} выше (листайте ↑) ...\n", style="dim cyan")
@@ -325,7 +340,7 @@ def _render_catalog(
         fit = classify_model_fit(vram_min, size, hw)
 
         idx_str = f"{i+1:>2}."
-        disp_name = name if len(name) <= 38 else (name[:35] + "...")
+        disp_name = name if len(name) <= name_col_w else (name[: name_col_w - 3] + "...")
         size_str = f"{size:.1f} GB" if size > 0 else "   --   "
         vram_str = f"~{vram_min:.1f} GB" if vram_min > 0 else "    --    "
 
@@ -357,7 +372,7 @@ def _render_catalog(
             status_text = "Не потянет"
             status_style = "bold red"
 
-        row_content = f"  {idx_str} {disp_name:<38} {size_str:>8}   {vram_str:>18}   "
+        row_content = f"  {idx_str} {disp_name:<{name_col_w}} {size_str:>8}   {vram_str:>{mem_col_w}}   "
 
         if is_cursor:
             t.append(row_content, style="bold black on bright_white")
@@ -369,8 +384,9 @@ def _render_catalog(
                     style="rgb(255,170,0)",
                 )
             elif fit == "red" and not is_installed and not is_downloading and not is_queued:
+                target_hw_label = "на Mac доступно ~{ram_gb:.0f} GB объединённой памяти" if is_apple_silicon else "на ПК доступно ~{ram_gb:.0f} GB памяти"
                 t.append(
-                    f"       ! Не рекомендуется: модели нужно ~{vram_min:.1f} GB, на ПК доступно ~{ram_gb:.0f} GB памяти\n",
+                    f"       ! Не рекомендуется: модели нужно ~{vram_min:.1f} GB, {target_hw_label.format(ram_gb=ram_gb)}\n",
                     style="bold red",
                 )
         else:
@@ -380,7 +396,7 @@ def _render_catalog(
     if visible_end < total:
         t.append(f"      ▼  ... еще {total - visible_end} ниже (листайте ↓) ...\n", style="dim cyan")
 
-    t.append(" " + chr(0x2500) * 86 + "\n", style="dim")
+    t.append(" " + chr(0x2500) * divider_len + "\n", style="dim")
 
     active_cnt, pending_cnt = GLOBAL_PULL_MANAGER.active_and_pending_count()
     if active_cnt > 0 or pending_cnt > 0:
@@ -391,10 +407,12 @@ def _render_catalog(
     else:
         t.append("\n")
 
-    t.append(
-        " Стрелки ↑↓ / PgUp PgDn — выбор       Enter — скачать / в очередь       q / Esc — выход\n",
-        style="dim",
+    hint_line = (
+        " ↑↓/PgUp/PgDn — выбор   Enter — скачать   q/Esc — выход\n"
+        if is_narrow
+        else " Стрелки ↑↓ / PgUp PgDn — выбор       Enter — скачать / в очередь       q / Esc — выход\n"
     )
+    t.append(hint_line, style="dim")
     return t
 
 
@@ -432,94 +450,103 @@ def interactive_model_catalog() -> str | None:
         auto_refresh=False,
         transient=True,
     ) as live:
-        while True:
-            action = poll_key_crossplatform()
-            needs_render = False
-            if action:
-                notification = ""
-                needs_render = True
-                if action == "UP":
-                    cursor = (cursor - 1) % total
-                elif action == "DOWN":
-                    cursor = (cursor + 1) % total
-                elif action == "PGUP":
-                    cursor = max(0, cursor - page_size)
-                elif action == "PGDN":
-                    cursor = min(total - 1, cursor + page_size)
-                elif action == "HOME":
-                    cursor = 0
-                elif action == "END":
-                    cursor = total - 1
-                elif action == "ENTER":
-                    chosen = items[cursor]
-                    if chosen.get("category") == "custom":
-                        live.stop()
-                        try:
-                            raw = secondary_session.prompt(
-                                HTML("<b><ansigreen>Тег модели из Ollama › </ansigreen></b>")
-                            ).strip()
-                        except (KeyboardInterrupt, EOFError):
-                            raw = ""
-                        if raw:
-                            res = GLOBAL_PULL_MANAGER.enqueue(raw)
-                            if res != "empty":
-                                last_selected_model = raw
-                            notification = _enqueue_status_message(res, raw)
-                        live.start()
-                    else:
-                        model_name = chosen["name"]
-                        fit = classify_model_fit(chosen["vram_min"], chosen["size_gb"], hw)
-
-                        if fit == "red":
+        with raw_terminal_mode():
+            while True:
+                action = poll_key_crossplatform()
+                needs_render = False
+                if action:
+                    notification = ""
+                    needs_render = True
+                    if action == "UP":
+                        cursor = (cursor - 1) % total
+                    elif action == "DOWN":
+                        cursor = (cursor + 1) % total
+                    elif action == "PGUP":
+                        cursor = max(0, cursor - page_size)
+                    elif action == "PGDN":
+                        cursor = min(total - 1, cursor + page_size)
+                    elif action == "HOME":
+                        cursor = 0
+                    elif action == "END":
+                        cursor = total - 1
+                    elif action == "ENTER":
+                        chosen = items[cursor]
+                        if chosen.get("category") == "custom":
                             live.stop()
-                            console.print()
-                            console.print(
-                                f"[bold red]⚠️ Внимание:[/bold red] Модель [bold]{model_name}[/bold] требует ~{chosen['vram_min']:.1f} GB памяти.\n"
-                                f"На вашем ПК доступно ~{hw['vram_gb']:.0f} GB VRAM + {hw['ram_gb']:.0f} GB RAM.\n"
-                                "[yellow]Модель может вызвать зависание системы или не запуститься.[/yellow]"
-                            )
-                            try:
-                                ans = secondary_session.prompt(
-                                    HTML("<b><ansired>Всё равно скачать? (y/n) › </ansired></b>")
-                                ).strip().lower()
-                            except (KeyboardInterrupt, EOFError):
-                                ans = "n"
+                            with cooked_terminal_mode():
+                                try:
+                                    raw = secondary_session.prompt(
+                                        HTML("<b><ansigreen>Тег модели из Ollama › </ansigreen></b>")
+                                    ).strip()
+                                except (KeyboardInterrupt, EOFError):
+                                    raw = ""
+                            if raw:
+                                res = GLOBAL_PULL_MANAGER.enqueue(raw)
+                                if res != "empty":
+                                    last_selected_model = raw
+                                notification = _enqueue_status_message(res, raw)
                             live.start()
-                            if ans not in ("y", "yes", "д", "да"):
-                                notification = f"Загрузка {model_name} отменена"
-                                live.update(
-                                    _render_catalog(items, cursor, scroll_offset, page_size, hw, notification),
-                                    refresh=True,
+                        else:
+                            model_name = chosen["name"]
+                            fit = classify_model_fit(chosen["vram_min"], chosen["size_gb"], hw)
+
+                            if fit == "red":
+                                live.stop()
+                                console.print()
+                                is_apple = "Apple" in hw.get("gpu_name", "")
+                                hw_desc = (
+                                    f"На вашем Mac доступно ~{hw['ram_gb']:.0f} GB объединённой памяти (Unified Memory).\n"
+                                    if is_apple
+                                    else f"На вашем ПК доступно ~{hw['vram_gb']:.0f} GB VRAM + {hw['ram_gb']:.0f} GB RAM.\n"
                                 )
-                                last_render = time.monotonic()
-                                continue
+                                console.print(
+                                    f"[bold red]⚠️ Внимание:[/bold red] Модель [bold]{escape_markup(model_name)}[/bold] требует ~{chosen['vram_min']:.1f} GB памяти.\n"
+                                    f"{hw_desc}"
+                                    "[yellow]Модель может вызвать зависание системы или не запуститься.[/yellow]"
+                                )
+                                with cooked_terminal_mode():
+                                    try:
+                                        ans = secondary_session.prompt(
+                                            HTML("<b><ansired>Всё равно скачать? (y/n) › </ansired></b>")
+                                        ).strip().lower()
+                                    except (KeyboardInterrupt, EOFError):
+                                        ans = "n"
+                                live.start()
+                                if ans not in ("y", "yes", "д", "да"):
+                                    notification = f"Загрузка {model_name} отменена"
+                                    live.update(
+                                        _render_catalog(items, cursor, scroll_offset, page_size, hw, notification),
+                                        refresh=True,
+                                    )
+                                    last_render = time.monotonic()
+                                    continue
 
-                        last_selected_model = model_name
-                        res = GLOBAL_PULL_MANAGER.enqueue(model_name)
-                        notification = _enqueue_status_message(res, model_name)
+                            last_selected_model = model_name
+                            res = GLOBAL_PULL_MANAGER.enqueue(model_name)
+                            notification = _enqueue_status_message(res, model_name)
 
-                elif action == "EXIT":
-                    break
-                elif action.isascii() and action.isdigit():
-                    n = int(action)
-                    if 1 <= n <= total:
-                        cursor = n - 1
+                    elif action == "EXIT":
+                        break
+                    elif action.isascii() and action.isdigit():
+                        n = int(action)
+                        if 1 <= n <= total:
+                            cursor = n - 1
 
-            if cursor < scroll_offset:
-                scroll_offset = cursor
-            elif cursor >= scroll_offset + page_size:
-                scroll_offset = cursor - page_size + 1
+                if cursor < scroll_offset:
+                    scroll_offset = cursor
+                elif cursor >= scroll_offset + page_size:
+                    scroll_offset = cursor - page_size + 1
 
-            now = time.monotonic()
-            active_cnt, pending_cnt = GLOBAL_PULL_MANAGER.active_and_pending_count()
-            if needs_render or ((active_cnt > 0 or pending_cnt > 0) and (now - last_render) >= 0.25):
-                live.update(
-                    _render_catalog(items, cursor, scroll_offset, page_size, hw, notification),
-                    refresh=True,
-                )
-                last_render = now
+                now = time.monotonic()
+                active_cnt, pending_cnt = GLOBAL_PULL_MANAGER.active_and_pending_count()
+                if needs_render or ((active_cnt > 0 or pending_cnt > 0) and (now - last_render) >= 0.25):
+                    live.update(
+                        _render_catalog(items, cursor, scroll_offset, page_size, hw, notification),
+                        refresh=True,
+                    )
+                    last_render = now
 
-            time.sleep(0.04)
+                time.sleep(0.04)
 
     return last_selected_model
 
@@ -581,6 +608,7 @@ def first_time_setup_wizard() -> str | None:
 
     cfg = load_user_config()
     cfg["default_model"] = selected
-    save_user_config(cfg)
+    if not save_user_config(cfg):
+        console.print("[yellow]Предупреждение: модель скачана, но не удалось сохранить её как модель по умолчанию.[/yellow]")
     console.print(f"[bold green]✓ Стартовая модель {escape_markup(selected)} готова к работе![/bold green]")
     return selected

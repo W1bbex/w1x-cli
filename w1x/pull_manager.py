@@ -63,6 +63,11 @@ def _extract_pull_chunk(chunk: Any) -> tuple[str, int, int]:
     return status, completed, total
 
 
+def _normalize_tag(name: str) -> str:
+    name = name.strip()
+    return name if ":" in name else f"{name}:latest"
+
+
 class AsyncPullManager:
     """Единый потокобезопасный менеджер фоновой и CLI-загрузки моделей."""
 
@@ -72,22 +77,53 @@ class AsyncPullManager:
         self.queue: list[str] = []
         self._worker_thread: threading.Thread | None = None
         self._installed_cache: set[str] | None = None
+        self._last_fetch_failed: bool = False
+        self._last_fetch_time: float = 0.0
+        self._aborted: bool = False
 
     def _fetch_installed_set(self) -> set[str] | None:
         from . import models
 
         models.LAST_LIST_ERROR = None
-        names = models.installed_models()
-        if models.LAST_LIST_ERROR is not None:
+        if hasattr(models, "get_installed_models_with_status"):
+            try:
+                names, err = models.get_installed_models_with_status(show_error=False)
+                if err is not None:
+                    return None
+                return set(names)
+            except TypeError:
+                pass
+        try:
+            names = models.installed_models(show_error=False)
+        except TypeError:
+            names = models.installed_models()
+        if getattr(models, "LAST_LIST_ERROR", None) is not None:
             return None
         return set(names)
 
-    def refresh_installed(self) -> set[str]:
+    def refresh_installed(self, force: bool = False) -> set[str]:
         """Обновить кэш установленных моделей из Ollama вне мьютекса."""
-        fetched = self._fetch_installed_set()
+        now = time.monotonic()
         with self._lock:
+            if not force and self._last_fetch_failed and (now - self._last_fetch_time < 3.0):
+                return set(self._installed_cache) if self._installed_cache is not None else set()
+
+        fetched = self._fetch_installed_set()
+        now = time.monotonic()
+        with self._lock:
+            self._last_fetch_time = now
             if fetched is not None:
-                self._installed_cache = fetched
+                self._installed_cache = fetched.union(
+                    name for name, t in self.tasks.items() if t.status == "completed"
+                )
+                self._last_fetch_failed = False
+                if force:
+                    norm_fetched = {_normalize_tag(m) for m in fetched}
+                    for name, task in list(self.tasks.items()):
+                        if task.status == "completed" and _normalize_tag(name) not in norm_fetched:
+                            del self.tasks[name]
+            else:
+                self._last_fetch_failed = True
             return set(self._installed_cache) if self._installed_cache is not None else set()
 
     def get_installed(self) -> set[str]:
@@ -103,17 +139,23 @@ class AsyncPullManager:
         if not clean:
             return "empty"
 
+        norm_clean = _normalize_tag(clean)
         installed = self.get_installed()
         with self._lock:
-            if clean in installed or (self._installed_cache is not None and clean in self._installed_cache):
+            self._aborted = False
+            norm_installed = {_normalize_tag(m) for m in installed}
+            if norm_clean in norm_installed or (
+                self._installed_cache is not None
+                and norm_clean in {_normalize_tag(m) for m in self._installed_cache}
+            ):
                 return "already_installed"
 
-            existing = self.tasks.get(clean)
-            if existing:
-                if existing.status in ("queued", "downloading"):
-                    return "already_in_progress"
-                if existing.status == "completed":
-                    return "already_completed"
+            for t_name, existing in self.tasks.items():
+                if _normalize_tag(t_name) == norm_clean:
+                    if existing.status in ("queued", "downloading"):
+                        return "already_in_progress"
+                    if existing.status == "completed":
+                        return "already_completed"
 
             task = DownloadTask(clean)
             self.tasks[clean] = task
@@ -173,7 +215,11 @@ class AsyncPullManager:
             console.print("[yellow]Очередь загрузки пуста.[/yellow]")
             return False
 
-        self.refresh_installed()
+        from . import models
+
+        self.refresh_installed(force=True)
+        if models.LAST_LIST_ERROR is not None:
+            return False
         console.print(f"\n[cyan]Очередь загрузки:[/cyan] {len(ordered_names)} моделей")
         tracked: list[str] = []
         already_ok = 0
@@ -242,6 +288,7 @@ class AsyncPullManager:
                         break
                     time.sleep(0.15)
         except KeyboardInterrupt:
+            self.abort()
             console.print("\n[yellow]Ожидание загрузки прервано пользователем.[/yellow]")
             return False
 
@@ -259,6 +306,18 @@ class AsyncPullManager:
         console.print(f"[bold green]Готово: {succeeded}/{len(ordered_names)} моделей доступно[/bold green]\n")
         return not failed
 
+    def abort(self) -> None:
+        """Остановить очередь загрузок и пометить ожидающие задачи отменёнными."""
+        with self._lock:
+            self._aborted = True
+            for model_name in self.queue:
+                task = self.tasks.get(model_name)
+                if task and task.status == "queued":
+                    task.status = "error"
+                    task.error_msg = "Загрузка отменена пользователем"
+                    task.status_msg = "Отменено"
+            self.queue.clear()
+
     def _worker_loop(self) -> None:
         while True:
             with self._lock:
@@ -272,14 +331,20 @@ class AsyncPullManager:
                 task.status = "downloading"
                 task.status_msg = "Подключение..."
 
-            last_calc_time = time.time()
+            last_calc_time = time.monotonic()
             last_bytes = 0
 
             try:
                 for chunk in pull(current_model, stream=True):
+                    with self._lock:
+                        if self._aborted:
+                            task.status = "error"
+                            task.error_msg = "Загрузка отменена пользователем"
+                            task.status_msg = "Отменено"
+                            break
                     status, completed, total = _extract_pull_chunk(chunk)
 
-                    now = time.time()
+                    now = time.monotonic()
                     if completed < last_bytes:
                         last_bytes = completed
                         last_calc_time = now

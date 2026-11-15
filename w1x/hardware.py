@@ -36,7 +36,7 @@ def detect_hardware() -> HardwareInfo:
     elif sys.platform == "darwin":
         try:
             mem_raw = subprocess.check_output(
-                ["sysctl", "-n", "hw.memsize"], text=True, stderr=subprocess.DEVNULL
+                ["sysctl", "-n", "hw.memsize"], text=True, stderr=subprocess.DEVNULL, timeout=5
             ).strip()
             if mem_raw.isdigit():
                 hw["ram_gb"] = round(int(mem_raw) / (1024 ** 3), 1)
@@ -46,6 +46,7 @@ def detect_hardware() -> HardwareInfo:
                     ["sysctl", "-n", "machdep.cpu.brand_string"],
                     text=True,
                     stderr=subprocess.DEVNULL,
+                    timeout=5,
                 ).strip()
             except Exception:
                 pass
@@ -74,6 +75,7 @@ def detect_hardware() -> HardwareInfo:
             ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
             stderr=subprocess.DEVNULL,
             text=True,
+            timeout=5,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         lines = [line.strip() for line in out.strip().splitlines() if line.strip()]

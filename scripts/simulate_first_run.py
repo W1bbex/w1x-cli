@@ -26,9 +26,11 @@ def main():
         config.CONFIG_FILE_PATH = sandbox / "config.json"
 
         def initially_empty_models():
+            models.LAST_LIST_ERROR = None
             return installed_models() if config.CONFIG_FILE_PATH.exists() else []
 
         models.installed_models = initially_empty_models
+        models.LAST_LIST_ERROR = None
         try:
             app_mod.main()
         finally:

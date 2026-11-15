@@ -8,6 +8,7 @@ import sys
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from .terminal import console, render_message
 from .types import ChatMessage
@@ -55,7 +56,7 @@ def extract_latest_python_code(messages: Sequence[ChatMessage]) -> str:
         content = str(message.get("content") or "")
 
         # 1. Ищем блоки в тройных кавычках ``` ... ``` (только Python или без тега)
-        blocks = list(re.finditer(r"```([a-zA-Z0-9_-]*)\r?\n([\s\S]*?)```", content))
+        blocks = list(re.finditer(r"```([a-zA-Z0-9_-]*)[ \t]*\r?\n([\s\S]*?)```", content))
         for match in reversed(blocks):
             lang = match.group(1).strip().lower()
             if lang and lang not in {"python", "py", "python3"}:
@@ -99,6 +100,21 @@ def extract_latest_python_code(messages: Sequence[ChatMessage]) -> str:
     return ""
 
 
+def has_explicit_top_call(tree: Any, target_name: str) -> bool:
+    """Проверить наличие явного вызова функции на уровне модуля."""
+    if tree is None:
+        return False
+    for node in getattr(tree, "body", []):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for subnode in ast.walk(node):
+            if isinstance(subnode, ast.Call):
+                fn = subnode.func
+                if isinstance(fn, ast.Name) and fn.id == target_name:
+                    return True
+    return False
+
+
 def run_interactive_python_test(code: str) -> tuple[int, str]:
     """Запустить интерактивное тестирование Python-кода в отдельном окне CMD."""
     temp_dir = Path(tempfile.mkdtemp(prefix="w1x-testpy-"))
@@ -108,6 +124,7 @@ def run_interactive_python_test(code: str) -> tuple[int, str]:
     exit_code_file = temp_dir / "exit_code.txt"
 
     runner_code = """# -*- coding: utf-8 -*-
+import ast
 import os
 import sys
 import inspect
@@ -127,6 +144,20 @@ try:
         f.write("")
 except Exception:
     pass
+
+
+def has_explicit_top_call(tree, target_name):
+    if tree is None:
+        return False
+    for node in getattr(tree, "body", []):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for subnode in ast.walk(node):
+            if isinstance(subnode, ast.Call):
+                fn = subnode.func
+                if isinstance(fn, ast.Name) and fn.id == target_name:
+                    return True
+    return False
 
 
 class TeeStream:
@@ -216,6 +247,12 @@ def main():
         exit_code = 0
 
         try:
+            parsed_tree = None
+            try:
+                parsed_tree = ast.parse(code_text)
+            except Exception:
+                pass
+
             global_scope = {
                 "__name__": "__main__",
                 "__file__": script_file_path,
@@ -236,8 +273,10 @@ def main():
                     "cli",
                 ]
                 for ep in entry_points:
+                    if has_explicit_top_call(parsed_tree, ep):
+                        continue
                     fn = global_scope.get(ep)
-                    if callable(fn):
+                    if callable(fn) and not inspect.iscoroutinefunction(fn):
                         try:
                             sig = inspect.signature(fn)
                             requires_args = any(
@@ -256,7 +295,12 @@ def main():
                             fn()
                             break
         except SystemExit as exc:
-            exit_code = exc.code if isinstance(exc.code, int) else (1 if exc.code is not None else 0)
+            if exc.code is None or exc.code is False:
+                exit_code = 0
+            elif isinstance(exc.code, int) and not isinstance(exc.code, bool):
+                exit_code = exc.code
+            else:
+                exit_code = 1
         except KeyboardInterrupt:
             exit_code = 130
             print("\\n[Выполнение остановлено пользователем (Ctrl+C)]")
@@ -273,10 +317,13 @@ def main():
         all_sessions_log.append(f"--- Запуск #{run_count} (код {exit_code}) ---\\n{run_text}")
 
         # Сохраняем общий лог после каждого запуска
-        with open(log_file_path, "w", encoding="utf-8", errors="replace") as f:
-            f.write("\\n\\n".join(all_sessions_log))
-        with open(exit_code_path, "w", encoding="utf-8") as f:
-            f.write(str(final_exit_code))
+        try:
+            with open(log_file_path, "w", encoding="utf-8", errors="replace") as f:
+                f.write("\\n\\n".join(all_sessions_log))
+            with open(exit_code_path, "w", encoding="utf-8") as f:
+                f.write(str(final_exit_code))
+        except Exception:
+            pass
 
         print("\\n" + "=" * 64)
         if exit_code == 0:
@@ -318,7 +365,11 @@ if __name__ == "__main__":
         except Exception:
             pass
 """
-    creation_flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if os.name == "nt" else 0
+    creation_flags = (
+        getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        if os.name == "nt" and not os.environ.get("PYTEST_CURRENT_TEST")
+        else 0
+    )
     exit_code = 0
     log_content = ""
     try:
@@ -326,14 +377,27 @@ if __name__ == "__main__":
         runner_file.write_text(runner_code, encoding="utf-8")
 
         console.print()
-        render_message("Открываю отдельное окно CMD для тестирования…", role="tool")
-        console.print("[dim]Окно открыто. Протестируйте программу и завершите её для возврата в чат.[/dim]")
+        if os.name == "nt":
+            render_message("Открываю отдельное окно CMD для тестирования…", role="tool")
+            console.print("[dim]Окно открыто. Протестируйте программу и завершите её для возврата в чат.[/dim]")
+        else:
+            render_message("Запускаю интерактивное тестирование…", role="tool")
+            console.print("[dim]Протестируйте программу и завершите её для возврата в чат.[/dim]")
 
-        proc = subprocess.run(
-            [sys.executable, str(runner_file)],
-            creationflags=creation_flags,
-            check=False,
-        )
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(runner_file)],
+                creationflags=creation_flags,
+                check=False,
+            )
+        except KeyboardInterrupt:
+            exit_code = 130
+            log_content = "[Тестирование прервано пользователем по Ctrl+C]"
+            return exit_code, log_content
+        except OSError as err:
+            exit_code = 1
+            log_content = f"[Не удалось запустить процесс: {err}]"
+            return exit_code, log_content
 
         if exit_code_file.exists():
             try:

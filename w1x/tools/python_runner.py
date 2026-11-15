@@ -6,7 +6,10 @@ import tempfile
 from rich.panel import Panel
 from rich.syntax import Syntax
 
-from ..terminal import HTML, console, render_message, secondary_session
+from prompt_toolkit.formatted_text import HTML
+
+from ..prompts import secondary_session
+from ..terminal import console, render_message
 
 
 def run_python_code(code: str, purpose: str, inputs: str = "") -> str:
@@ -20,7 +23,8 @@ def run_python_code(code: str, purpose: str, inputs: str = "") -> str:
     Returns:
         Код завершения, stdout и stderr программы.
     """
-    if not code.strip():
+    code = str("" if code is None else code).strip()
+    if not code:
         return "Ошибка: модель передала пустой код."
     if len(code) > 8000:
         return "Ошибка: код длиннее 8000 символов и не будет запущен."
@@ -32,8 +36,10 @@ def run_python_code(code: str, purpose: str, inputs: str = "") -> str:
     console.print()
     render_message("Зачем нужен Python ›", role="assistant_label")
     render_message(purpose[:600], role="assistant")
-    if inputs:
-        formatted_inputs = ", ".join(repr(line) for line in str(inputs).splitlines() if line)
+    has_inputs = inputs is not None and str(inputs) != ""
+    if has_inputs:
+        input_lines = str(inputs).splitlines() or [""]
+        formatted_inputs = ", ".join(repr(line) for line in input_lines)
         render_message(f"Входные данные для input() › {formatted_inputs}", role="assistant_label")
     console.print()
     console.print(

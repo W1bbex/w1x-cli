@@ -101,7 +101,10 @@ def calculate_datetime(
     system_now = datetime.now().astimezone().replace(microsecond=0)
     if base_datetime:
         try:
-            now = datetime.fromisoformat(str(base_datetime).strip())
+            raw_iso = str(base_datetime).strip()
+            if raw_iso.endswith(("Z", "z")):
+                raw_iso = raw_iso[:-1] + "+00:00"
+            now = datetime.fromisoformat(raw_iso)
             if now.tzinfo is None:
                 now = now.replace(tzinfo=system_now.tzinfo)
             now = now.replace(microsecond=0)
@@ -268,20 +271,37 @@ def parse_datetime_request(text: str, require_pure: bool = True) -> dict[str, An
                 prefix = normalized[:match.start()]
                 fwd_before = list(forward_re.finditer(prefix))
                 bwd_before = list(backward_re.finditer(prefix))
+                closest_before: tuple[int, int] | None = None
                 if fwd_before or bwd_before:
-                    last_fwd = fwd_before[-1].start() if fwd_before else -1
-                    last_bwd = bwd_before[-1].start() if bwd_before else -1
-                    comp_dir = 1 if last_fwd > last_bwd else -1
-                else:
-                    suffix = normalized[match.end():]
-                    fwd_after = forward_re.search(suffix)
-                    bwd_after = backward_re.search(suffix)
-                    if fwd_after and (not bwd_after or fwd_after.start() < bwd_after.start()):
-                        comp_dir = 1
-                    elif bwd_after:
-                        comp_dir = -1
+                    last_fwd_end = fwd_before[-1].end() if fwd_before else -1
+                    last_bwd_end = bwd_before[-1].end() if bwd_before else -1
+                    if last_fwd_end > last_bwd_end:
+                        closest_before = (match.start() - last_fwd_end, 1)
                     else:
-                        comp_dir = default_direction
+                        closest_before = (match.start() - last_bwd_end, -1)
+
+                suffix = normalized[match.end():]
+                fwd_after = forward_re.search(suffix)
+                bwd_after = backward_re.search(suffix)
+                closest_after: tuple[int, int] | None = None
+                if fwd_after and bwd_after:
+                    if fwd_after.start() < bwd_after.start():
+                        closest_after = (fwd_after.start(), 1)
+                    else:
+                        closest_after = (bwd_after.start(), -1)
+                elif fwd_after:
+                    closest_after = (fwd_after.start(), 1)
+                elif bwd_after:
+                    closest_after = (bwd_after.start(), -1)
+
+                if closest_before is not None and closest_after is not None:
+                    comp_dir = closest_after[1] if closest_after[0] < closest_before[0] else closest_before[1]
+                elif closest_after is not None:
+                    comp_dir = closest_after[1]
+                elif closest_before is not None:
+                    comp_dir = closest_before[1]
+                else:
+                    comp_dir = default_direction
                 value = abs(raw_value) * comp_dir
             unit = match.group("unit")
             if unit.startswith("д"):

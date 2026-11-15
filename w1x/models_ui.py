@@ -5,19 +5,29 @@ from collections.abc import Set as AbstractSet
 from typing import Any
 
 from rich.live import Live
+from rich.markup import escape as escape_markup
 from rich.panel import Panel
 
+from . import models as models_mod
 from .catalog_ui import first_time_setup_wizard
 from .config import load_user_config, save_user_config
 from .models import (
     _normalize_model_tag,
     get_last_model,
-    installed_models,
     running_models,
     save_last_model,
     unload_all_models,
 )
-from .terminal import HTML, console, poll_key_crossplatform, secondary_session
+from prompt_toolkit.formatted_text import HTML
+
+from .key_input import poll_key_crossplatform, raw_terminal_mode
+from .prompts import secondary_session
+from .terminal import console
+
+
+def installed_models() -> list[str]:
+    """Вернуть установленные модели через текущую ссылку модуля models."""
+    return models_mod.installed_models()
 
 
 def render_models_panel(
@@ -35,15 +45,16 @@ def render_models_panel(
         is_cursor = i == selected_idx
         if i < len(models):
             name = models[i]
+            safe_name = escape_markup(name)
             is_warm = (name in active_exact) or (_normalize_model_tag(name) in active_norm)
             num_str = f"{i+1:2d}."
             tag_str = "  [VRAM]" if is_warm else ""
 
             if is_cursor:
-                line_content = f" > {num_str} {name:<35} {tag_str}  [ВЫБРАНА - Enter]"
+                line_content = f" > {num_str} {safe_name:<35} {tag_str}  [ВЫБРАНА - Enter]"
                 lines.append(f"[bold black on bright_white]{line_content:<78}[/bold black on bright_white]")
             else:
-                lines.append(f"   [cyan]{num_str}[/cyan] [white]{name:<35}[/white] [dim magenta]{tag_str}[/dim magenta]")
+                lines.append(f"   [cyan]{num_str}[/cyan] [white]{safe_name:<35}[/white] [dim magenta]{tag_str}[/dim magenta]")
         else:
             num_str = " +."
             label = "+ Скачать новую модель из библиотеки Ollama (Тир-Лист)"
@@ -78,6 +89,8 @@ def choose_model(current: str | None = None) -> str | None:
     models = installed_models()
 
     if not models:
+        if models_mod.LAST_LIST_ERROR is not None:
+            return None
         new_model = first_time_setup_wizard()
         if new_model:
             models = installed_models()
@@ -85,7 +98,8 @@ def choose_model(current: str | None = None) -> str | None:
             console.print("[yellow]Модель не выбрана.[/yellow]")
             return None
 
-    default_model = current or get_last_model(models)
+    valid_current = current if current and current not in {"не выбрана", "None"} else None
+    default_model = valid_current or get_last_model(models)
     selected_idx = models.index(default_model) if default_model in models else 0
     total_items = len(models) + 1
 
@@ -102,33 +116,34 @@ def choose_model(current: str | None = None) -> str | None:
         auto_refresh=False,
         transient=True,
     ) as live:
-        while True:
-            action = poll_key_crossplatform()
-            if action:
-                prev_idx = selected_idx
-                if action == "UP":
-                    selected_idx = (selected_idx - 1) % total_items
-                elif action == "DOWN":
-                    selected_idx = (selected_idx + 1) % total_items
-                elif action == "ENTER":
-                    break
-                elif action == "EXIT":
-                    return None
-                elif action.isdigit():
-                    num = int(action)
-                    if 1 <= num <= len(models):
-                        selected_idx = num - 1
+        with raw_terminal_mode():
+            while True:
+                action = poll_key_crossplatform()
+                if action:
+                    prev_idx = selected_idx
+                    if action == "UP":
+                        selected_idx = (selected_idx - 1) % total_items
+                    elif action == "DOWN":
+                        selected_idx = (selected_idx + 1) % total_items
+                    elif action == "ENTER":
                         break
-                if selected_idx != prev_idx:
-                    live.update(render_models_panel(models, selected_idx, active_in_vram), refresh=True)
-            time.sleep(0.04)
+                    elif action == "EXIT":
+                        return None
+                    elif action.isdigit():
+                        num = int(action)
+                        if 1 <= num <= len(models):
+                            selected_idx = num - 1
+                            break
+                    if selected_idx != prev_idx:
+                        live.update(render_models_panel(models, selected_idx, active_in_vram), refresh=True)
+                time.sleep(0.04)
 
     if selected_idx == len(models):
         downloaded = first_time_setup_wizard()
         if downloaded:
             save_last_model(downloaded)
             return downloaded
-        return default_model
+        return default_model if default_model in models else (models[0] if models else None)
 
     chosen = models[selected_idx]
     save_last_model(chosen)
@@ -140,15 +155,27 @@ def interactive_config_menu() -> None:
     """Интерактивное меню настройки W1x CLI."""
     while True:
         cfg: dict[str, Any] = dict(load_user_config())
-        current_m = str(cfg.get("default_model", "не выбрана"))
-        keep_mins = int(cfg.get("keep_alive_minutes", 30))
-        ctx_tokens = int(cfg.get("context_tokens", 8192))
-        stats = bool(cfg.get("stats_enabled", False))
+        raw_default = cfg.get("default_model")
+        current_m = (
+            str(raw_default)
+            if isinstance(raw_default, str) and raw_default.strip() and raw_default not in {"не выбрана", "None"}
+            else "не выбрана"
+        )
+        try:
+            keep_mins = int(cfg.get("keep_alive_minutes", 30))
+        except (TypeError, ValueError):
+            keep_mins = 30
+        try:
+            ctx_tokens = int(cfg.get("context_tokens", 8192))
+        except (TypeError, ValueError):
+            ctx_tokens = 8192
+        raw_stats = cfg.get("stats_enabled", False)
+        stats = raw_stats is True
 
         console.print()
         console.print(
             Panel(
-                f"[bold cyan]1.[/bold cyan] Модель по умолчанию: [bold green]{current_m}[/bold green]\n"
+                f"[bold cyan]1.[/bold cyan] Модель по умолчанию: [bold green]{escape_markup(current_m)}[/bold green]\n"
                 f"[bold cyan]2.[/bold cyan] Удержание в VRAM (Keep-Alive): [bold yellow]{keep_mins} мин[/bold yellow] [dim](0 = мгновенная выгрузка)[/dim]\n"
                 f"[bold cyan]3.[/bold cyan] Размер контекста (num_ctx): [bold magenta]{ctx_tokens} токенов[/bold magenta] (~{int(ctx_tokens*3.5)} симв.)\n"
                 f"[bold cyan]4.[/bold cyan] Статистика скорости ответов: [bold]{'Включена' if stats else 'Выключена'}[/bold]\n"
@@ -173,11 +200,13 @@ def interactive_config_menu() -> None:
 
         if choice == "1":
             console.print()
-            new_m = choose_model(current=current_m)
-            if new_m:
+            new_m = choose_model(current=current_m if current_m != "не выбрана" else None)
+            if new_m and new_m in models_mod.installed_models():
                 cfg["default_model"] = new_m
-                save_user_config(cfg)
-                console.print(f"[green]✓ Модель по умолчанию изменена на {new_m}[/green]")
+                if save_user_config(cfg):
+                    console.print(f"[green]✓ Модель по умолчанию изменена на {escape_markup(new_m)}[/green]")
+                else:
+                    console.print("[red]Ошибка: не удалось сохранить настройки на диск.[/red]")
 
         elif choice == "2":
             console.print()
@@ -189,8 +218,10 @@ def interactive_config_menu() -> None:
                 continue
             if val.isdigit():
                 cfg["keep_alive_minutes"] = int(val)
-                save_user_config(cfg)
-                console.print(f"[green]✓ Удержание в VRAM установлено: {val} мин.[/green]")
+                if save_user_config(cfg):
+                    console.print(f"[green]✓ Удержание в VRAM установлено: {val} мин.[/green]")
+                else:
+                    console.print("[red]Ошибка: не удалось сохранить настройки на диск.[/red]")
 
         elif choice == "3":
             console.print()
@@ -203,22 +234,27 @@ def interactive_config_menu() -> None:
                 continue
             if val.isdigit() and int(val) >= 512:
                 cfg["context_tokens"] = int(val)
-                save_user_config(cfg)
-                console.print(f"[green]✓ Размер контекста установлен: {val} токенов (~{int(int(val)*3.5)} симв.)[/green]")
+                if save_user_config(cfg):
+                    console.print(f"[green]✓ Размер контекста установлен: {val} токенов (~{int(int(val)*3.5)} симв.)[/green]")
+                else:
+                    console.print("[red]Ошибка: не удалось сохранить настройки на диск.[/red]")
 
         elif choice == "4":
             cfg["stats_enabled"] = not stats
-            save_user_config(cfg)
-            state = "включена" if not stats else "выключена"
-            console.print(f"[green]✓ Статистика {state}.[/green]")
+            if save_user_config(cfg):
+                state = "включена" if not stats else "выключена"
+                console.print(f"[green]✓ Статистика {state}.[/green]")
+            else:
+                console.print("[red]Ошибка: не удалось сохранить настройки на диск.[/red]")
 
         elif choice == "5":
             downloaded = first_time_setup_wizard()
             if downloaded:
                 cfg["default_model"] = downloaded
-                save_user_config(cfg)
+                if not save_user_config(cfg):
+                    console.print("[red]Ошибка: не удалось сохранить выбранную модель в конфиг.[/red]")
 
         elif choice == "6":
             unloaded = unload_all_models()
-            msg = ", ".join(unloaded) if unloaded else "нет активных моделей"
+            msg = escape_markup(", ".join(unloaded)) if unloaded else "нет активных моделей"
             console.print(f"[green]✓ Модели выгружены из VRAM ({msg}).[/green]")

@@ -43,8 +43,8 @@ def ask_antigravity(task: str, context: str = "") -> str:
     executable = shutil.which("agy")
     if not executable:
         return "ESCALATE_ERROR: команда agy не найдена в PATH."
-    task = _redact_secrets(task.strip())
-    context = _redact_secrets(context.strip())
+    task = _redact_secrets(str("" if task is None else task).strip())
+    context = _redact_secrets(str("" if context is None else context).strip())
     if not task:
         return "ESCALATE_ERROR: задача для Antigravity пуста."
     if len(task) > 4000:
@@ -111,10 +111,10 @@ def ask_antigravity(task: str, context: str = "") -> str:
 
     output = (stdout or "").strip()
     error_text = (stderr or "").strip()
-    combined_error = f"{output}\n{error_text}".lower()
-    if "permission" in combined_error and ("denied" in combined_error or "failed" in combined_error):
-        return "ESCALATE_ERROR: Antigravity запросила запрещённое действие; доступ не выдан."
     if return_code != 0:
+        combined_error = f"{error_text}\n{output}".lower()
+        if "permission" in combined_error and ("denied" in combined_error or "failed" in combined_error):
+            return "ESCALATE_ERROR: Antigravity запросила запрещённое действие; доступ не выдан."
         details = (error_text or output or "без описания")[-1200:]
         return f"ESCALATE_ERROR: agy завершилась с кодом {return_code}: {details}"
     if not output:
@@ -171,6 +171,9 @@ def run_agy_for_user(task: str, messages: Sequence[ChatMessage]) -> str:
         lambda: ask_antigravity(task, recent_context_for_agy(messages)),
         on_interrupt=cancel_active_agy,
     )
-    render_message("Antigravity ›", role="assistant_label")
-    render_message(result, role="assistant")
+    if result.startswith("ESCALATE_ERROR:"):
+        render_message(result, role="notice")
+    else:
+        render_message("Antigravity ›", role="assistant_label")
+        render_message(result, role="assistant")
     return result
