@@ -3,10 +3,9 @@ import subprocess
 import sys
 import tempfile
 
+from prompt_toolkit.formatted_text import HTML
 from rich.panel import Panel
 from rich.syntax import Syntax
-
-from prompt_toolkit.formatted_text import HTML
 
 from ..prompts import secondary_session
 from ..terminal import console, render_message
@@ -63,7 +62,7 @@ def run_python_code(code: str, purpose: str, inputs: str = "") -> str:
     if confirmation not in {"y", "yes", "д", "да"}:
         return "Пользователь отказался запускать код."
 
-    with tempfile.TemporaryDirectory(prefix="ollama-python-") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="ollama-python-", ignore_cleanup_errors=True) as temp_dir:
         try:
             has_inputs = inputs is not None and str(inputs) != ""
             completed = subprocess.run(

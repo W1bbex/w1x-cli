@@ -21,6 +21,7 @@ _MEMORY_STOPWORDS = {
     "какой", "кто", "мне", "мой", "моя", "мое", "моё", "на", "называется",
     "о", "он", "она", "по", "про", "с", "скажи", "ты", "у", "что", "это", "я",
     "ли", "же", "бы", "хоть", "был", "была", "было", "звали", "зовут",
+    "пожалуйста", "пж", "плиз", "удали", "забудь", "стереть",
 }
 
 _GENERAL_MEMORY_PATTERNS = (
@@ -55,6 +56,14 @@ def load_facts_with_status() -> tuple[list[MemoryFact], bool]:
     except OSError:
         return [], False
     if not isinstance(payload, list):
+        try:
+            corrupt_p = facts_p.with_name(f"{facts_p.stem}.corrupted.{int(time.time())}.json")
+            shutil.move(facts_p, corrupt_p)
+        except Exception:
+            try:
+                facts_p.unlink(missing_ok=True)
+            except Exception:
+                pass
         return [], True
     return [
         item  # type: ignore[misc]
@@ -146,7 +155,8 @@ def _stem_word(word: str) -> str:
 def _memory_words(text: str) -> set[str]:
     words = set()
     safe_text = "" if text is None else str(text)
-    for raw in re.findall(r"[a-zа-яё_-]{2,}|\d+", safe_text.casefold()):
+    normalized = safe_text.replace("-", " ")
+    for raw in re.findall(r"[a-zа-яё_]{2,}|\d+", normalized.casefold()):
         if raw not in _MEMORY_STOPWORDS:
             stem = _stem_word(raw)
             if stem:
@@ -233,7 +243,10 @@ def forget_facts(query: str) -> str:
     removed = []
     for item in facts:
         fact_words = _memory_words(item["fact"])
-        match = all(qw in fact_words for qw in query_words)
+        match = all(
+            qw in fact_words or (len(qw) >= 3 and any(qw in fw or fw in qw for fw in fact_words))
+            for qw in query_words
+        )
         if match:
             removed.append(item["fact"])
         else:
@@ -313,8 +326,21 @@ def looks_like_memory_question(text: str) -> bool:
     )
 
 
+def is_memory_migrated() -> bool:
+    cfg = config.load_user_config()
+    return bool(cfg.get("memory_migrated", False))
+
+
+def set_memory_migrated() -> None:
+    cfg = dict(config.load_user_config())
+    cfg["memory_migrated"] = True
+    config.save_user_config(cfg)
+
+
 def migrate_explicit_memory(messages: Sequence[ChatMessage]) -> int:
     """Один раз подобрать старые фразы «запомни» из сохранённого диалога."""
+    if is_memory_migrated():
+        return 0
     facts, ok = load_facts_with_status()
     if not ok:
         return 0
@@ -339,6 +365,8 @@ def migrate_explicit_memory(messages: Sequence[ChatMessage]) -> int:
             }
         )
         migrated += 1
-    if migrated and not save_facts(facts[-200:]):
-        return 0
+    if migrated:
+        if not save_facts(facts[-200:]):
+            return 0
+    set_memory_migrated()
     return migrated

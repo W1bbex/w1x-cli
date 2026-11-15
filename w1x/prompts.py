@@ -1,6 +1,6 @@
 """Управление prompt_toolkit-сессиями, горячими клавишами, подсказками и вводом пользователя."""
+import io
 import os
-import sys
 import time
 from collections.abc import Callable, Iterable
 from typing import Any, cast
@@ -8,7 +8,7 @@ from typing import Any, cast
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
 from prompt_toolkit.completion import Completer, Completion
-from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.formatted_text import HTML, to_plain_text
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
 from prompt_toolkit.key_binding import KeyBindings
@@ -222,7 +222,11 @@ def exit_app_ctrl_q(event: Any) -> None:
 
 @bindings.add("c-s")
 def undo_and_restore_prompt(event: Any) -> None:
-    cancelled_prompt = str(ACTIVE_SESSION_DATA.pop("cancelled_prompt", "") or "")
+    session_state = ACTIVE_SESSION_DATA.get("session_state")
+    if session_state is not None and hasattr(session_state, "pop_cancelled_prompt"):
+        cancelled_prompt = session_state.pop_cancelled_prompt()
+    else:
+        cancelled_prompt = str(ACTIVE_SESSION_DATA.pop("cancelled_prompt", "") or "")
     if cancelled_prompt:
         buffer = event.app.current_buffer
         buffer.text = cancelled_prompt
@@ -456,6 +460,15 @@ def get_secondary_session() -> PromptSession[str] | None:
     return _secondary_session
 
 
+def _format_prompt_for_input(prompt_arg: Any) -> str:
+    if not prompt_arg:
+        return ""
+    try:
+        return to_plain_text(prompt_arg)
+    except Exception:
+        return str(prompt_arg)
+
+
 class _SessionProxy:
     def __init__(self, factory: Callable[[], PromptSession[str] | None]) -> None:
         self._factory = factory
@@ -468,9 +481,13 @@ class _SessionProxy:
 
     def prompt(self, *args: Any, **kwargs: Any) -> str:
         s = self._factory()
-        if s is None:
-            return input(str(args[0]) if args else "")
-        return cast(str, s.prompt(*args, **kwargs))
+        if s is not None:
+            try:
+                return cast(str, s.prompt(*args, **kwargs))
+            except (io.UnsupportedOperation, ValueError, OSError):
+                pass
+        prompt_text = _format_prompt_for_input(args[0]) if args else ""
+        return input(prompt_text)
 
 
 session = _SessionProxy(get_session)

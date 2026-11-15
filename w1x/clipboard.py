@@ -110,6 +110,8 @@ def _win32_copy_to_clipboard(text: str) -> bool:
         kernel32.GlobalLock.restype = ctypes.c_void_p
         kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
         kernel32.GlobalUnlock.restype = wintypes.BOOL
+        kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalFree.restype = wintypes.HGLOBAL
 
         user32.OpenClipboard.argtypes = [wintypes.HWND]
         user32.OpenClipboard.restype = wintypes.BOOL
@@ -130,10 +132,15 @@ def _win32_copy_to_clipboard(text: str) -> bool:
                 return False
             ptr = kernel32.GlobalLock(handle)
             if not ptr:
+                kernel32.GlobalFree(handle)
                 return False
             ctypes_mod.memmove(ptr, encoded, len(encoded))
             kernel32.GlobalUnlock(handle)
-            return bool(user32.SetClipboardData(CF_UNICODETEXT, handle))
+            res = user32.SetClipboardData(CF_UNICODETEXT, handle)
+            if not res:
+                kernel32.GlobalFree(handle)
+                return False
+            return True
         finally:
             user32.CloseClipboard()
     except Exception:
@@ -151,7 +158,7 @@ def copy_to_clipboard(text: str) -> None:
                     "powershell.exe",
                     "-NoProfile",
                     "-Command",
-                    "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard",
+                    "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; $input | Set-Clipboard",
                 ],
                 input=text.encode("utf-8"),
                 check=True,

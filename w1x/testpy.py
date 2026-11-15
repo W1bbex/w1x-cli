@@ -261,7 +261,7 @@ def main():
             exec(compile(code_text, script_file_path, "exec"), global_scope)
 
             # Если модель только объявила def main() / calculator() и забыла вызвать внизу
-            if not session_log and not inputs_called:
+            if not inputs_called:
                 entry_points = [
                     "main",
                     "calculator",
@@ -301,6 +301,8 @@ def main():
                 exit_code = exc.code
             else:
                 exit_code = 1
+                if exc.code is not None:
+                    print(str(exc.code), file=sys.stderr)
         except KeyboardInterrupt:
             exit_code = 130
             print("\\n[Выполнение остановлено пользователем (Ctrl+C)]")

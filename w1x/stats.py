@@ -119,7 +119,7 @@ def add_to_totals(totals: SessionTotals, stats: StatsRecord | None) -> None:
     if stats is None:
         return
     totals["requests"] += 1
-    totals["prompt_tokens"] += stats.get("prompt_tokens", 0)
-    totals["output_tokens"] += stats.get("output_tokens", 0)
-    totals["total_tokens"] += stats.get("total_tokens", 0)
+    totals["prompt_tokens"] += stats.get("prompt_tokens") or 0
+    totals["output_tokens"] += stats.get("output_tokens") or 0
+    totals["total_tokens"] += stats.get("total_tokens") or 0
     totals["total_duration"] += stats.get("total_duration") or 0

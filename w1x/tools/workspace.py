@@ -18,6 +18,27 @@ _EXCLUDED_WORKSPACE_DIRS = {
     ".tox",
 }
 
+_SECRET_OR_EXCLUDED_EXTS = {".pem", ".key", ".pfx", ".p12"}
+
+
+def _is_path_allowed(path: Path, root: Path) -> bool:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
+    parts = relative.parts
+    for part in parts:
+        if part in _EXCLUDED_WORKSPACE_DIRS:
+            return False
+        if part.startswith("."):
+            return False
+    name_lower = path.name.lower()
+    if any(name_lower.endswith(ext) for ext in _SECRET_OR_EXCLUDED_EXTS):
+        return False
+    if "id_rsa" in name_lower or "id_ed25519" in name_lower:
+        return False
+    return True
+
 
 def set_file_workspace(path_text: str) -> Path:
     """Установить корневую директорию workspace в config."""
@@ -42,6 +63,8 @@ def _safe_workspace_path(relative_path: str) -> Path:
         candidate.relative_to(root)
     except ValueError as error:
         raise ValueError("Путь выходит за пределы выбранной папки проекта.") from error
+    if candidate != root and not _is_path_allowed(candidate, root):
+        raise ValueError("Доступ к служебным или скрытым файлам/директориям запрещён.")
     return candidate
 
 

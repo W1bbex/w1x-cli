@@ -179,21 +179,19 @@ def _extract_base_datetime(text: str) -> str:
     time_match = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?\b", normalized)
     month_pattern = "|".join(_MONTH_NUMBER_RU)
     date_match = re.search(
-        rf"\b([0-3]?\d)\s+({month_pattern})(?:\s+(20\d{{2}}))?\b",
+        rf"\b([0-3]?\d)\s+({month_pattern})(?:\s+(\d{{4}}))?\b",
         normalized,
     )
     numeric_date_match = re.search(
-        r"\b([0-3]?\d)[./]([01]?\d)[./](20\d{2}|\d{2})\b",
+        r"\b([0-3]?\d)[./]([01]?\d)[./](\d{4}|\d{2})\b",
         normalized,
     )
     iso_date_match = re.search(
-        r"\b(20\d{2})-([01]\d)-([0-3]\d)\b",
+        r"\b(\d{4})-([01]\d)-([0-3]\d)\b",
         normalized,
     )
     has_any_date = bool(date_match or numeric_date_match or iso_date_match)
     if not time_match and not has_any_date:
-        return ""
-    if not has_any_date and not re.search(r"\b(?:если\s+)?сейчас\b", normalized):
         return ""
     current = datetime.now().astimezone().replace(microsecond=0)
     if date_match:

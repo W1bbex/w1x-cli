@@ -1400,11 +1400,24 @@ def test_choose_model_filters_placeholder_current(monkeypatch):
 def test_win32_copy_to_clipboard_unicode_and_emojis():
     from w1x import clipboard
 
+    old_clip = None
+    try:
+        old_clip = clipboard._read_clipboard_text()
+    except Exception:
+        old_clip = None
+
     test_string = "Привет мир! 🚀 W1x CLI UTF-8: 100 - 20% = 80."
-    clipboard.copy_to_clipboard(test_string)
-    if os.name == "nt":
-        read_back = clipboard._read_clipboard_text()
-        assert read_back == test_string
+    try:
+        clipboard.copy_to_clipboard(test_string)
+        if os.name == "nt":
+            read_back = clipboard._read_clipboard_text()
+            assert read_back == test_string
+    finally:
+        if old_clip is not None:
+            try:
+                clipboard.copy_to_clipboard(old_clip)
+            except Exception:
+                pass
 
 
 def test_rich_markup_escaping_prevents_markup_error(monkeypatch, tmp_path):
@@ -1712,6 +1725,7 @@ def test_chat_store_load_current_chat_handles_null_messages(tmp_path, monkeypatc
 
 def test_has_explicit_top_call_detects_assignment_and_try():
     import ast
+
     from w1x.testpy import has_explicit_top_call
 
     tree1 = ast.parse("rc = main()")
@@ -1729,6 +1743,7 @@ def test_has_explicit_top_call_detects_assignment_and_try():
 
 def test_load_facts_with_status_handles_oserror_on_exists(tmp_path, monkeypatch):
     from pathlib import Path
+
     from w1x import config, memory
 
     fake_file = tmp_path / "protected_facts.json"
@@ -1756,7 +1771,8 @@ def test_memory_rank_facts_and_relevant_block():
 
 
 def test_session_state_encapsulation_and_active_data_sync():
-    from w1x import app as w1x_app, config
+    from w1x import app as w1x_app
+    from w1x import config
 
     state = w1x_app._SessionState(
         model="demo-model",
@@ -1829,6 +1845,7 @@ def test_get_installed_models_with_status_contract(monkeypatch):
 def test_render_catalog_responsive_width_and_apple_silicon(monkeypatch):
     import shutil
     from collections import namedtuple
+
     from w1x import catalog_ui
 
     TerminalSize = namedtuple("TerminalSize", ["columns", "lines"])
@@ -1873,6 +1890,7 @@ def test_decomposed_domain_modules_integrity():
 
 def test_conftest_hermetic_isolation_active(tmp_path):
     from pathlib import Path
+
     from w1x import config
 
     # The autouse fixture must guarantee isolated directories
@@ -1880,6 +1898,201 @@ def test_conftest_hermetic_isolation_active(tmp_path):
     assert config.CONFIG_FILE_PATH != Path.home() / ".w1x" / "config.json"
     assert config.CURRENT_CHAT_PATH != Path.home() / ".w1x" / "current-chat.json"
     assert config.FACTS_PATH != Path.home() / ".w1x" / "memory-facts.json"
+
+
+def test_pull_manager_aborted_task_never_completed(monkeypatch):
+    from w1x.pull_manager import AsyncPullManager, DownloadTask
+
+    manager = AsyncPullManager()
+    task = DownloadTask(model_name="test:model")
+    task.status = "downloading"
+    manager.tasks["test:model"] = task
+    manager.queue = ["test:model"]
+    manager._aborted = True
+
+    # Simulate chunk stream where abort occurred
+    def fake_pull(model, stream=True):
+        yield {"status": "downloading", "completed": 50, "total": 100}
+
+    monkeypatch.setattr("w1x.pull_manager.pull", fake_pull)
+    manager._installed_cache = set()
+    manager._worker_loop()
+
+    assert task.status == "error"
+    assert "test:model" not in manager._installed_cache
+
+
+def test_execute_chat_turn_retry_interrupt_resilience():
+    from w1x.app import _SessionState
+
+    state = _SessionState(
+        model="demo",
+        system_prompt="sys",
+        messages=[
+            {"role": "user", "content": "первый вопрос"},
+            {"role": "assistant", "content": "первый ответ"},
+        ],
+    )
+    # Simulate /retry turn start: previous assistant message popped
+    state.messages.pop()
+    retry_prompt = state.messages[-1]["content"]
+
+    # Interrupted during retry: set cancelled prompt and rollback user turn
+    state.set_cancelled_prompt(retry_prompt)
+    state.rollback_last_turn()
+    assert len(state.messages) == 0
+
+    # Next user message must not result in consecutive user turns
+    state.append_user_message("новый вопрос")
+    roles = [m["role"] for m in state.messages]
+    assert roles == ["user"]
+    assert state.messages[-1]["content"] == "новый вопрос"
+
+
+def test_session_state_pop_cancelled_prompt_syncs():
+    from w1x import config
+    from w1x.app import _SessionState
+
+    state = _SessionState(model="demo", system_prompt="sys", messages=[])
+    state.set_cancelled_prompt("prompt to restore")
+    assert config.ACTIVE_SESSION_DATA["cancelled_prompt"] == "prompt to restore"
+
+    popped = state.pop_cancelled_prompt()
+    assert popped == "prompt to restore"
+    assert "cancelled_prompt" not in config.ACTIVE_SESSION_DATA
+
+    state.sync_active_data()
+    assert "cancelled_prompt" not in config.ACTIVE_SESSION_DATA
+
+
+def test_memory_migration_runs_only_once_and_persists_flag(tmp_path, monkeypatch):
+    from w1x import config, memory
+
+    fake_config = tmp_path / "config.json"
+    fake_facts = tmp_path / "facts.json"
+    monkeypatch.setattr(config, "CONFIG_FILE_PATH", fake_config)
+    monkeypatch.setattr(config, "FACTS_PATH", fake_facts)
+
+    messages = [
+        {"role": "user", "content": "запомни мой город Москва"},
+    ]
+    migrated = memory.migrate_explicit_memory(messages)
+    assert migrated == 1
+    assert memory.is_memory_migrated() is True
+
+    # User explicitly forgets the fact
+    memory.forget_facts("москва")
+    assert len(memory.load_facts()) == 0
+
+    # Second migration must be a no-op and must not resurrect forgotten fact
+    migrated_again = memory.migrate_explicit_memory(messages)
+    assert migrated_again == 0
+    assert len(memory.load_facts()) == 0
+
+
+def test_chat_store_quarantines_corrupted_json(tmp_path, monkeypatch):
+    from w1x import chat_store, config
+
+    corrupted_chat = tmp_path / "current-chat.json"
+    corrupted_chat.write_text("{\"broken_json\": ", encoding="utf-8")
+    monkeypatch.setattr(config, "CURRENT_CHAT_PATH", corrupted_chat)
+
+    prompt, messages = chat_store.load_current_chat()
+    assert prompt == config.DEFAULT_SYSTEM_PROMPT
+    assert len(messages) == 1
+
+    corrupted_backups = list(tmp_path.glob("current-chat.corrupted.*.json"))
+    assert len(corrupted_backups) == 1
+
+
+def test_workspace_rejects_dotfiles_and_env(tmp_path):
+    from w1x.tools import workspace
+
+    workspace_dir = tmp_path / "my_project"
+    workspace_dir.mkdir()
+    env_file = workspace_dir / ".env"
+    env_file.write_text("SECRET_KEY=12345", encoding="utf-8")
+    git_dir = workspace_dir / ".git"
+    git_dir.mkdir()
+    git_config = git_dir / "config"
+    git_config.write_text("[core]\nrepositoryformatversion = 0", encoding="utf-8")
+
+    workspace.set_file_workspace(str(workspace_dir))
+    assert "Ошибка доступа" in workspace.read_project_file(".env")
+    assert "Ошибка доступа" in workspace.read_project_file(".git/config")
+
+
+def test_antigravity_secret_mask_handles_hyphens():
+    from w1x.tools.antigravity import _redact_secrets
+
+    sample = "Keys: sk-proj-1234567890abcdef and sk-ant-api03-1234567890abcdef and ghp_1234567890abcdef"
+    redacted = _redact_secrets(sample)
+    assert "sk-proj" not in redacted
+    assert "sk-ant" not in redacted
+    assert "ghp_" not in redacted
+    assert "[СЕКРЕТ СКРЫТ]" in redacted
+
+
+def test_math_tool_hex_and_octal_literals():
+    from w1x.tools.math_tool import calculate_expression
+
+    assert calculate_expression("0x10 + 0b101") == "21"
+    assert calculate_expression("0o77") == "63"
+
+
+def test_datetime_historical_year_and_explicit_time():
+    from w1x.tools.datetime_tool import _extract_base_datetime
+
+    iso_1995 = _extract_base_datetime("15 мая 1995 года")
+    assert "1995-05-15" in iso_1995
+
+    iso_time = _extract_base_datetime("через 2 часа от 14:00")
+    assert "14:00:00" in iso_time
+
+
+def test_stats_none_token_values_safe():
+    from w1x.stats import add_to_totals, empty_totals
+
+    totals = empty_totals()
+    stats = {"prompt_tokens": None, "output_tokens": None, "total_tokens": None, "total_duration": None}
+    add_to_totals(totals, stats)  # Must not raise TypeError
+    assert totals["requests"] == 1
+    assert totals["prompt_tokens"] == 0
+
+
+def test_hardware_multi_gpu_formatting(monkeypatch):
+    import subprocess
+
+    from w1x import hardware
+
+    fake_output = (
+        "NVIDIA GeForce RTX 3080, 10240\n"
+        "NVIDIA GeForce RTX 3080, 10240\n"
+    )
+    monkeypatch.setattr(subprocess, "check_output", lambda *args, **kwargs: fake_output)
+
+    info = hardware.detect_hardware()
+    assert "2x" in info["gpu_name"]
+    assert info["vram_gb"] == 10.0
+
+
+def test_prompts_session_proxy_plain_text_fallback():
+    from prompt_toolkit.formatted_text import HTML
+
+    from w1x.prompts import _format_prompt_for_input
+
+    plain = _format_prompt_for_input(HTML("<b><ansigreen>Ты › </ansigreen></b>"))
+    assert "Ты ›" in plain
+    assert "<b>" not in plain
+
+
+def test_looks_like_launch_command_allows_code_questions():
+    from w1x.app import looks_like_launch_command
+
+    assert looks_like_launch_command("python main.py") is True
+    assert looks_like_launch_command("Python script test.py fails with error, why?") is False
+    assert looks_like_launch_command("Как запустить py script.py?") is False
+
 
 
 

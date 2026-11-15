@@ -366,11 +366,12 @@ class AsyncPullManager:
                             task.status_msg = status
 
                 with self._lock:
-                    task.status = "completed"
-                    task.percentage = 100.0
-                    task.status_msg = "Установлена"
-                    if self._installed_cache is not None:
-                        self._installed_cache.add(current_model)
+                    if not self._aborted and task.status != "error":
+                        task.status = "completed"
+                        task.percentage = 100.0
+                        task.status_msg = "Установлена"
+                        if self._installed_cache is not None:
+                            self._installed_cache.add(current_model)
 
             except Exception as err:
                 with self._lock:

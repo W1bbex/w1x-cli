@@ -4,13 +4,19 @@ from collections.abc import Sequence
 from collections.abc import Set as AbstractSet
 from typing import Any
 
+from prompt_toolkit.formatted_text import HTML
 from rich.live import Live
 from rich.markup import escape as escape_markup
 from rich.panel import Panel
 
 from . import models as models_mod
-from .catalog_ui import first_time_setup_wizard
+from .catalog_ui import (
+    first_time_setup_wizard,
+    interactive_model_catalog,
+    wait_for_download_queue,
+)
 from .config import load_user_config, save_user_config
+from .key_input import poll_key_crossplatform, raw_terminal_mode
 from .models import (
     _normalize_model_tag,
     get_last_model,
@@ -18,9 +24,6 @@ from .models import (
     save_last_model,
     unload_all_models,
 )
-from prompt_toolkit.formatted_text import HTML
-
-from .key_input import poll_key_crossplatform, raw_terminal_mode
 from .prompts import secondary_session
 from .terminal import console
 
@@ -34,14 +37,25 @@ def render_models_panel(
     models: Sequence[str],
     selected_idx: int,
     active_in_vram: AbstractSet[str],
+    page_size: int = 10,
 ) -> Panel:
-    """Отрисовать панель моделей с подсветкой текущего курсора (чёрным по белому)."""
+    """Отрисовать панель моделей с подсветкой текущего курсора и пагинацией при длинном списке."""
     lines: list[str] = []
     total_items = len(models) + 1
     active_exact = set(active_in_vram)
     active_norm = {_normalize_model_tag(act) for act in active_in_vram}
 
-    for i in range(total_items):
+    if total_items > 12:
+        scroll_offset = max(0, min(selected_idx - page_size // 2, total_items - page_size))
+        visible_end = min(total_items, scroll_offset + page_size)
+    else:
+        scroll_offset = 0
+        visible_end = total_items
+
+    if scroll_offset > 0:
+        lines.append(f"   [dim cyan]▲  ... еще {scroll_offset} выше (листайте ↑) ...[/dim cyan]")
+
+    for i in range(scroll_offset, visible_end):
         is_cursor = i == selected_idx
         if i < len(models):
             name = models[i]
@@ -63,6 +77,9 @@ def render_models_panel(
                 lines.append(f"\n[bold black on bright_cyan]{line_content:<78}[/bold black on bright_cyan]")
             else:
                 lines.append(f"\n   [cyan]{num_str}[/cyan] [dim cyan]{label}[/dim cyan]")
+
+    if visible_end < total_items:
+        lines.append(f"   [dim cyan]▼  ... еще {total_items - visible_end} ниже (листайте ↓) ...[/dim cyan]")
 
     return Panel(
         "\n".join(lines),
@@ -139,7 +156,15 @@ def choose_model(current: str | None = None) -> str | None:
                 time.sleep(0.04)
 
     if selected_idx == len(models):
-        downloaded = first_time_setup_wizard()
+        if not models:
+            downloaded = first_time_setup_wizard()
+        else:
+            interactive_model_catalog()
+            wait_for_download_queue()
+            new_models = installed_models()
+            diff = [m for m in new_models if m not in models]
+            downloaded = diff[0] if diff else None
+
         if downloaded:
             save_last_model(downloaded)
             return downloaded
@@ -238,6 +263,8 @@ def interactive_config_menu() -> None:
                     console.print(f"[green]✓ Размер контекста установлен: {val} токенов (~{int(int(val)*3.5)} симв.)[/green]")
                 else:
                     console.print("[red]Ошибка: не удалось сохранить настройки на диск.[/red]")
+            elif val:
+                console.print("[yellow]Размер контекста должен быть числом не менее 512 токенов.[/yellow]")
 
         elif choice == "4":
             cfg["stats_enabled"] = not stats
@@ -248,11 +275,17 @@ def interactive_config_menu() -> None:
                 console.print("[red]Ошибка: не удалось сохранить настройки на диск.[/red]")
 
         elif choice == "5":
-            downloaded = first_time_setup_wizard()
-            if downloaded:
-                cfg["default_model"] = downloaded
-                if not save_user_config(cfg):
-                    console.print("[red]Ошибка: не удалось сохранить выбранную модель в конфиг.[/red]")
+            installed = models_mod.installed_models()
+            if not installed:
+                downloaded = first_time_setup_wizard()
+                if downloaded:
+                    cfg = dict(load_user_config())
+                    cfg["default_model"] = downloaded
+                    if not save_user_config(cfg):
+                        console.print("[red]Ошибка: не удалось сохранить выбранную модель в конфиг.[/red]")
+            else:
+                interactive_model_catalog()
+                wait_for_download_queue()
 
         elif choice == "6":
             unloaded = unload_all_models()

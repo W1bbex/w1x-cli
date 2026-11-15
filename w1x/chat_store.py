@@ -1,5 +1,7 @@
 """Хранение и восстановление истории диалога W1x."""
 import json
+import shutil
+import time
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
@@ -75,6 +77,19 @@ def save_current_chat(system_prompt: str, messages: Sequence[ChatMessage]) -> bo
         return False
 
 
+def _quarantine_corrupted_chat(target_path: Path) -> None:
+    """Переместить повреждённый файл диалога в карантин перед сбросом."""
+    try:
+        if target_path.exists():
+            corrupt_p = target_path.with_name(f"{target_path.stem}.corrupted.{int(time.time())}.json")
+            shutil.move(target_path, corrupt_p)
+    except Exception:
+        try:
+            target_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def load_current_chat() -> tuple[str, list[ChatMessage]]:
     """Восстановить сохранённый диалог или создать новый контекст."""
     target_path = config.CURRENT_CHAT_PATH
@@ -84,6 +99,7 @@ def load_current_chat() -> tuple[str, list[ChatMessage]]:
     try:
         state = json.loads(target_path.read_text(encoding="utf-8"))
         if not isinstance(state, dict):
+            _quarantine_corrupted_chat(target_path)
             return config.DEFAULT_SYSTEM_PROMPT, new_context(config.DEFAULT_SYSTEM_PROMPT)
         saved_system_prompt = state.get("system_prompt") or ""
         has_custom_prompt = state.get("custom_system_prompt") is True
@@ -118,6 +134,10 @@ def load_current_chat() -> tuple[str, list[ChatMessage]]:
             {"role": "system", "content": system_prompt},
             *saved_messages[-config.MAX_SAVED_MESSAGES:],
         ]
-    except (OSError, ValueError, TypeError, AttributeError) as error:
+    except (ValueError, TypeError, AttributeError) as error:
+        _quarantine_corrupted_chat(target_path)
+        config.logger.warning("Corrupted chat history quarantined %s: %s", target_path, error)
+        return config.DEFAULT_SYSTEM_PROMPT, new_context(config.DEFAULT_SYSTEM_PROMPT)
+    except OSError as error:
         config.logger.warning("Failed to restore chat history %s: %s", target_path, error)
         return config.DEFAULT_SYSTEM_PROMPT, new_context(config.DEFAULT_SYSTEM_PROMPT)

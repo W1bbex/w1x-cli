@@ -80,15 +80,21 @@ def detect_hardware() -> HardwareInfo:
         )
         lines = [line.strip() for line in out.strip().splitlines() if line.strip()]
         if lines:
-            parts = [part.strip() for part in lines[0].split(",")]
-            if len(parts) >= 2:
-                hw["gpu_name"] = parts[0]
-                vram_mb = sum(
-                    int(line.split(",")[1].strip())
-                    for line in lines
-                    if len(line.split(",")) >= 2 and line.split(",")[1].strip().isdigit()
-                )
-                hw["vram_gb"] = round(vram_mb / 1024, 1)
+            gpu_names = []
+            gpu_vrams = []
+            for line in lines:
+                split_parts = [p.strip() for p in line.split(",")]
+                if len(split_parts) >= 2 and split_parts[1].isdigit():
+                    gpu_names.append(split_parts[0])
+                    gpu_vrams.append(int(split_parts[1]))
+
+            if gpu_names and gpu_vrams:
+                if len(gpu_names) == 1:
+                    hw["gpu_name"] = gpu_names[0]
+                    hw["vram_gb"] = round(gpu_vrams[0] / 1024, 1)
+                else:
+                    hw["gpu_name"] = f"{len(gpu_names)}x {gpu_names[0]}"
+                    hw["vram_gb"] = round(gpu_vrams[0] / 1024, 1)
     except Exception:
         pass
 

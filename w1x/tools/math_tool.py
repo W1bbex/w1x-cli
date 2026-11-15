@@ -43,6 +43,8 @@ def _evaluate_math_node(node: ast.AST, source: str = "") -> Decimal:
     if isinstance(node, ast.Expression):
         return _evaluate_math_node(node.body, source)
     if isinstance(node, ast.Constant) and type(node.value) in {int, float}:
+        if isinstance(node.value, int):
+            return Decimal(node.value)
         if source:
             segment = ast.get_source_segment(source, node)
             if segment:

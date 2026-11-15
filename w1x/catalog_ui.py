@@ -4,6 +4,7 @@ import time
 from collections.abc import Sequence
 from typing import TypedDict
 
+from prompt_toolkit.formatted_text import HTML
 from rich.live import Live
 from rich.markup import escape as escape_markup
 from rich.panel import Panel
@@ -11,15 +12,13 @@ from rich.text import Text
 
 from .config import load_user_config, save_user_config
 from .hardware import classify_model_fit, detect_hardware
-from .pull_manager import GLOBAL_PULL_MANAGER
-from prompt_toolkit.formatted_text import HTML
-
 from .key_input import (
     cooked_terminal_mode,
     poll_key_crossplatform,
     raw_terminal_mode,
 )
 from .prompts import secondary_session
+from .pull_manager import GLOBAL_PULL_MANAGER
 from .terminal import console
 from .types import HardwareInfo
 
@@ -440,7 +439,7 @@ def interactive_model_catalog() -> str | None:
     last_selected_model = None
 
     term_height = shutil.get_terminal_size((80, 25)).lines
-    page_size = max(6, min(12, term_height - 11))
+    page_size = max(2, min(12, term_height - 11))
 
     console.print()
     last_render = time.monotonic()
@@ -549,6 +548,36 @@ def interactive_model_catalog() -> str | None:
                 time.sleep(0.04)
 
     return last_selected_model
+
+
+def wait_for_download_queue() -> None:
+    """Дождаться завершения всех активных и запланированных загрузок в очереди."""
+    active_cnt, pending_cnt = GLOBAL_PULL_MANAGER.active_and_pending_count()
+    if active_cnt == 0 and pending_cnt == 0:
+        return
+
+    console.print(
+        "\n[cyan]Ожидание завершения загрузок из каталога... (Ctrl+C — отменить ожидание фоновых задач)[/cyan]"
+    )
+    try:
+        with Live(console=console, auto_refresh=False, transient=True) as live:
+            while True:
+                active_cnt, pending_cnt = GLOBAL_PULL_MANAGER.active_and_pending_count()
+                if active_cnt == 0 and pending_cnt == 0:
+                    break
+                active_str_parts = []
+                for name, task in list(GLOBAL_PULL_MANAGER.tasks.items()):
+                    if task.status == "downloading":
+                        active_str_parts.append(f"{name}: {task.percentage:>2.0f}% ({task.speed})")
+                line_text = " | ".join(active_str_parts) if active_str_parts else "Подготовка..."
+                if pending_cnt > 0:
+                    line_text += f" (+{pending_cnt} в очереди)"
+                live.update(Text(f"  ▶ {line_text}", style="cyan"), refresh=True)
+                time.sleep(0.25)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Ожидание завершения загрузок прервано. Загрузки продолжаются в фоне.[/yellow]")
+    finally:
+        GLOBAL_PULL_MANAGER.refresh_installed(force=True)
 
 
 def first_time_setup_wizard() -> str | None:

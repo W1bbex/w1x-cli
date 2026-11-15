@@ -15,7 +15,7 @@ _SECRET_PATTERNS = [
         r"(?i)\b(api[_-]?key|secret|token|password|passwd|authorization)\b"
         r"\s*[:=]\s*([^\s,;]{8,})"
     ),
-    re.compile(r"\b(?:sk|ghp|github_pat)_[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"\b(?:sk|ghp|github_pat)[_-][A-Za-z0-9_-]{16,}\b"),
     re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----"),
 ]
 
@@ -27,9 +27,14 @@ def _redact_secrets(text: str) -> str:
     return redacted
 
 
+_AGY_CANCELLED = False
+
+
 def cancel_active_agy() -> None:
     """Немедленно завершить активный процесс agy, если он ещё выполняется."""
+    global _AGY_CANCELLED
     with config.ACTIVE_AGY_LOCK:
+        _AGY_CANCELLED = True
         process = config.ACTIVE_AGY_PROCESS
     if process is not None and process.poll() is None:
         try:
@@ -70,6 +75,11 @@ def ask_antigravity(task: str, context: str = "") -> str:
     safe_environment = {
         key: value for key, value in os.environ.items() if key.upper() in allowed_env_names
     }
+    global _AGY_CANCELLED
+    with config.ACTIVE_AGY_LOCK:
+        _AGY_CANCELLED = False
+        config.ACTIVE_AGY_PROCESS = None
+
     with tempfile.TemporaryDirectory(prefix="w1x-agy-") as temp_dir:
         process: subprocess.Popen[str] | None = None
         try:
@@ -85,6 +95,12 @@ def ask_antigravity(task: str, context: str = "") -> str:
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             with config.ACTIVE_AGY_LOCK:
+                if _AGY_CANCELLED:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                    return "ESCALATE_ERROR: Antigravity отменена пользователем."
                 config.ACTIVE_AGY_PROCESS = process
             stdout, stderr = process.communicate(timeout=config.AGY_TIMEOUT_SECONDS)
             return_code = process.returncode
