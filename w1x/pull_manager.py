@@ -113,15 +113,15 @@ class AsyncPullManager:
         with self._lock:
             self._last_fetch_time = now
             if fetched is not None:
-                self._installed_cache = fetched.union(
-                    name for name, t in self.tasks.items() if t.status == "completed"
-                )
-                self._last_fetch_failed = False
                 if force:
                     norm_fetched = {_normalize_tag(m) for m in fetched}
                     for name, task in list(self.tasks.items()):
                         if task.status == "completed" and _normalize_tag(name) not in norm_fetched:
                             del self.tasks[name]
+                self._installed_cache = fetched.union(
+                    name for name, t in self.tasks.items() if t.status == "completed"
+                )
+                self._last_fetch_failed = False
             else:
                 self._last_fetch_failed = True
             return set(self._installed_cache) if self._installed_cache is not None else set()

@@ -2126,6 +2126,28 @@ def test_pull_manager_tracks_tag_alias_until_real_completion(monkeypatch):
     assert result_box == [False]
 
 
+def test_refresh_installed_force_prunes_stale_completed_tasks_before_building_cache(monkeypatch):
+    from w1x import models as w1x_models
+    from w1x import pull_manager
+
+    mgr = pull_manager.AsyncPullManager()
+    removed = pull_manager.DownloadTask("removed-model:7b")
+    removed.status = "completed"
+    kept = pull_manager.DownloadTask("kept-model:4b")
+    kept.status = "completed"
+    mgr.tasks["removed-model:7b"] = removed
+    mgr.tasks["kept-model:4b"] = kept
+
+    monkeypatch.setattr(w1x_models, "get_installed_models_with_status", lambda **kwargs: (["kept-model:4b"], None))
+    monkeypatch.setattr(w1x_models, "installed_models", lambda **kwargs: ["kept-model:4b"])
+    monkeypatch.setattr(w1x_models, "LAST_LIST_ERROR", None)
+
+    installed = mgr.refresh_installed(force=True)
+    assert installed == {"kept-model:4b"}
+    assert mgr.get_installed() == {"kept-model:4b"}
+    assert "removed-model:7b" not in mgr.tasks
+
+
 
 
 
