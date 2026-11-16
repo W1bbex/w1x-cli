@@ -2094,6 +2094,38 @@ def test_looks_like_launch_command_allows_code_questions():
     assert looks_like_launch_command("Как запустить py script.py?") is False
 
 
+def test_pull_manager_tracks_tag_alias_until_real_completion(monkeypatch):
+    import threading
+    from w1x import models as w1x_models
+    from w1x import pull_manager
+
+    mgr = pull_manager.AsyncPullManager()
+    gate = threading.Event()
+    monkeypatch.setattr(w1x_models, "installed_models", lambda **kwargs: [])
+
+    def fake_pull(name, stream=True):
+        yield {"status": "downloading", "completed": 50, "total": 100}
+        gate.wait(timeout=5)
+        raise RuntimeError("network failure")
+
+    monkeypatch.setattr(pull_manager, "pull", fake_pull)
+
+    assert mgr.enqueue("qwen3") == "enqueued"
+    snap_via_alias = mgr.get_task_snapshot("qwen3:latest")
+    assert snap_via_alias is not None
+    assert snap_via_alias["status"] in ("queued", "downloading")
+
+    result_box = []
+    t = threading.Thread(target=lambda: result_box.append(mgr.run_cli_pull(["qwen3:latest"])), daemon=True)
+    t.start()
+    time.sleep(0.25)
+    assert result_box == []  # Must still be waiting on active qwen3 task
+
+    gate.set()
+    t.join(timeout=5)
+    assert result_box == [False]
+
+
 
 
 

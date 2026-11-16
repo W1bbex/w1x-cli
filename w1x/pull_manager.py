@@ -150,12 +150,16 @@ class AsyncPullManager:
             ):
                 return "already_installed"
 
+            stale_keys = []
             for t_name, existing in self.tasks.items():
                 if _normalize_tag(t_name) == norm_clean:
                     if existing.status in ("queued", "downloading"):
                         return "already_in_progress"
                     if existing.status == "completed":
                         return "already_completed"
+                    stale_keys.append(t_name)
+            for k in stale_keys:
+                self.tasks.pop(k, None)
 
             task = DownloadTask(clean)
             self.tasks[clean] = task
@@ -170,14 +174,28 @@ class AsyncPullManager:
                 self._worker_thread.start()
             return "enqueued"
 
+    def _resolve_task_entry_locked(self, model_name: str) -> tuple[str | None, DownloadTask | None]:
+        clean = (model_name or "").strip()
+        if not clean:
+            return None, None
+        task = self.tasks.get(clean)
+        if task is not None:
+            return clean, task
+        norm_target = _normalize_tag(clean)
+        for key, existing in self.tasks.items():
+            if _normalize_tag(key) == norm_target:
+                return key, existing
+        return None, None
+
     def get_task(self, model_name: str) -> DownloadTask | None:
         with self._lock:
-            return self.tasks.get(model_name)
+            _, task = self._resolve_task_entry_locked(model_name)
+            return task
 
     def get_task_snapshot(self, model_name: str) -> PullTaskSnapshot | None:
         """Получить согласованный снимок состояния задачи под блокировкой."""
         with self._lock:
-            task = self.tasks.get(model_name)
+            _, task = self._resolve_task_entry_locked(model_name)
             if task is None:
                 return None
             return {
@@ -192,9 +210,15 @@ class AsyncPullManager:
 
     def get_queue_position(self, model_name: str) -> int:
         with self._lock:
+            resolved_key, _ = self._resolve_task_entry_locked(model_name)
+            lookup_key = resolved_key or model_name.strip()
             try:
-                return self.queue.index(model_name) + 1
+                return self.queue.index(lookup_key) + 1
             except ValueError:
+                norm_target = _normalize_tag(model_name)
+                for idx, item in enumerate(self.queue):
+                    if _normalize_tag(item) == norm_target:
+                        return idx + 1
                 return 0
 
     def active_and_pending_count(self) -> tuple[int, int]:
@@ -206,9 +230,14 @@ class AsyncPullManager:
     def run_cli_pull(self, model_names: list[str]) -> bool:
         """Скачать список моделей последовательно в одной общей очереди с прогресс-баром."""
         ordered_names: list[str] = []
+        seen_tags: set[str] = set()
         for raw in model_names:
             clean = raw.strip()
-            if clean and clean not in ordered_names:
+            if not clean:
+                continue
+            norm = _normalize_tag(clean)
+            if norm not in seen_tags:
+                seen_tags.add(norm)
                 ordered_names.append(clean)
 
         if not ordered_names:
@@ -293,18 +322,24 @@ class AsyncPullManager:
             return False
 
         self.refresh_installed()
-        failed = [
-            name
-            for name in tracked
-            if (snap := self.get_task_snapshot(name)) is not None and snap["status"] == "error"
-        ]
-        succeeded = already_ok + (len(tracked) - len(failed))
+        failed: list[str] = []
+        missing: list[str] = []
+        for name in tracked:
+            snap = self.get_task_snapshot(name)
+            if snap is None:
+                missing.append(name)
+            elif snap["status"] != "completed":
+                failed.append(name)
+
+        succeeded = already_ok + (len(tracked) - len(failed) - len(missing))
         for name in failed:
             snap = self.get_task_snapshot(name)
-            err = snap["error_msg"] if snap else "неизвестная ошибка"
+            err = snap["error_msg"] if snap and snap["error_msg"] else f"неожиданный статус: {snap['status'] if snap else 'unknown'}"
             console.print(f"[red]✗ Ошибка загрузки {escape_markup(name)}: {escape_markup(err)}[/red]")
+        for name in missing:
+            console.print(f"[red]✗ Задача загрузки {escape_markup(name)} потеряна или не найдена.[/red]")
         console.print(f"[bold green]Готово: {succeeded}/{len(ordered_names)} моделей доступно[/bold green]\n")
-        return not failed
+        return not failed and not missing
 
     def abort(self) -> None:
         """Остановить очередь загрузок и пометить ожидающие задачи отменёнными."""
