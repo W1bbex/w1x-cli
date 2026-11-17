@@ -1,7 +1,9 @@
 """Изоляция тестового окружения от пользовательской директории ~/.w1x."""
+from types import SimpleNamespace
+
 import pytest
 
-from w1x import config
+from w1x import config, models
 
 
 @pytest.fixture(autouse=True)
@@ -17,6 +19,8 @@ def isolate_w1x_data_and_config(monkeypatch: pytest.MonkeyPatch, tmp_path: pytes
     monkeypatch.setattr(config, "CURRENT_CHAT_PATH", test_data_dir / "current-chat.json")
     monkeypatch.setattr(config, "FACTS_PATH", test_data_dir / "memory-facts.json")
     monkeypatch.setattr(config, "CONFIG_FILE_PATH", test_data_dir / "config.json")
+    monkeypatch.setattr(models, "ps", lambda: SimpleNamespace(models=[]))
+    monkeypatch.setattr(models, "generate", lambda **kwargs: None)
 
     config.ACTIVE_SESSION_DATA.clear()
     config.ACTIVE_FILE_ROOT = None

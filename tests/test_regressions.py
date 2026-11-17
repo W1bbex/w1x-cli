@@ -52,6 +52,8 @@ def test_preload_task_isolation():
         a_finished.set()
 
     def fake_generate_b(*args, **kwargs):
+        if kwargs.get("keep_alive") == 0:
+            return
         b_finished.wait(timeout=2.0)
 
     try:
@@ -72,7 +74,7 @@ def test_preload_task_isolation():
                 assert task_b is not task_a
 
                 assert a_finished.wait(timeout=2.0)
-                assert task_a.event.is_set()
+                assert task_a.event.wait(timeout=2.0)
                 assert not task_b.event.is_set()
                 b_finished.set()
     finally:
@@ -1564,9 +1566,11 @@ def test_pull_manager_abort_stops_stream_and_queue():
     assert mgr.tasks["model2"].status == "error"
 
 
-def test_preload_task_cancellation_and_reset_all_models():
+def test_preload_task_cancellation_and_reset_all_models(monkeypatch):
     from w1x import models as w1x_models
 
+    monkeypatch.setattr(w1x_models, "generate", lambda **kwargs: None)
+    monkeypatch.setattr(w1x_models, "ps", lambda: type("Response", (), {"models": []})())
     w1x_models.start_background_preload("first-model")
     task1 = w1x_models._CURRENT_PRELOAD
     assert task1 is not None
@@ -2096,6 +2100,7 @@ def test_looks_like_launch_command_allows_code_questions():
 
 def test_pull_manager_tracks_tag_alias_until_real_completion(monkeypatch):
     import threading
+
     from w1x import models as w1x_models
     from w1x import pull_manager
 
