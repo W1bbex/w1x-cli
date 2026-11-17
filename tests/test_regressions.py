@@ -1119,9 +1119,12 @@ def test_workspace_list_files_ignores_system_and_hidden_dirs(tmp_path, monkeypat
     assert "__pycache__" not in listing
 
 
-def test_tools_none_argument_safety():
+def test_tools_none_argument_safety(monkeypatch):
+    import shutil
+
     from w1x.tools import antigravity, math_tool, python_runner, search
 
+    monkeypatch.setattr(shutil, "which", lambda _cmd: None)
     assert search.search_web(None) == "Ошибка: пустой поисковый запрос."
     assert math_tool.calculate_expression(None) == "Ошибка: выражение пустое или слишком длинное."
     assert python_runner.run_python_code(None, "purpose") == "Ошибка: модель передала пустой код."

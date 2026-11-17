@@ -45,13 +45,13 @@ def cancel_active_agy() -> None:
 
 def ask_antigravity(task: str, context: str = "") -> str:
     """Передать сложную задачу в headless CLI agy с фильтрацией секретов."""
-    executable = shutil.which("agy")
-    if not executable:
-        return "ESCALATE_ERROR: команда agy не найдена в PATH."
     task = _redact_secrets(str("" if task is None else task).strip())
     context = _redact_secrets(str("" if context is None else context).strip())
     if not task:
         return "ESCALATE_ERROR: задача для Antigravity пуста."
+    executable = shutil.which("agy")
+    if not executable:
+        return "ESCALATE_ERROR: команда agy не найдена в PATH."
     if len(task) > 4000:
         task = task[:4000] + "\n… задача сокращена W1x"
     if len(context) > 1200:
