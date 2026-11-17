@@ -1,4 +1,5 @@
 """Управление моделями Ollama, фоновой предзагрузкой и выгрузкой из VRAM."""
+import logging
 import os
 import threading
 from collections.abc import Sequence
@@ -143,25 +144,67 @@ class PreloadTask:
         self.error: Exception | None = None
         self.thread: threading.Thread | None = None
         self.cancelled: bool = False
+        self.inherited_loaded: bool = False
 
 
 _CURRENT_PRELOAD: PreloadTask | None = None
 _PRELOAD_LOCK = threading.Lock()
+_MODEL_PRELOAD_LOCKS: dict[str, Any] = {}
+
+
+def _handoff_or_should_unload_locked(task: PreloadTask, key: str) -> bool:
+    """Under _PRELOAD_LOCK, transfer loaded ownership to an active replacement or request unload."""
+    replacement = _CURRENT_PRELOAD
+    if (
+        replacement is not None
+        and replacement is not task
+        and not replacement.cancelled
+        and _normalize_model_tag(replacement.name) == key
+    ):
+        replacement.inherited_loaded = True
+        return False
+    return True
 
 
 def _background_preload_worker(task: PreloadTask) -> None:
     try:
-        if task.cancelled:
-            return
-        generate(
-            model=task.name,
-            prompt="",
-            keep_alive=get_keep_alive(),
-            options={"num_ctx": get_context_tokens()},
-        )
+        key = _normalize_model_tag(task.name)
+        with _PRELOAD_LOCK:
+            model_lock = _MODEL_PRELOAD_LOCKS.setdefault(key, threading.Lock())
+        with model_lock:
+            with _PRELOAD_LOCK:
+                cancelled_before_load = task.cancelled
+                inherited = task.inherited_loaded
+                should_unload_inherited = (
+                    _handoff_or_should_unload_locked(task, key)
+                    if cancelled_before_load and inherited
+                    else False
+                )
+            if cancelled_before_load:
+                if should_unload_inherited:
+                    generate(model=task.name, prompt="", keep_alive=0)
+                return
+
+            generate(
+                model=task.name,
+                prompt="",
+                keep_alive=get_keep_alive(),
+                options={"num_ctx": get_context_tokens()},
+            )
+
+            with _PRELOAD_LOCK:
+                should_unload = (
+                    _handoff_or_should_unload_locked(task, key)
+                    if task.cancelled
+                    else False
+                )
+            if should_unload:
+                generate(model=task.name, prompt="", keep_alive=0)
     except Exception as e:
         if not task.cancelled:
             task.error = e
+        else:
+            logging.getLogger("w1x").warning("Cancelled preload cleanup failed for %s: %s", task.name, e)
     finally:
         task.event.set()
 
