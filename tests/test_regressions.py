@@ -1402,6 +1402,7 @@ def test_choose_model_filters_placeholder_current(monkeypatch):
     monkeypatch.setattr(models_ui, "installed_models", lambda: fake_models)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 clipboard roundtrip requires Windows")
 def test_win32_copy_to_clipboard_unicode_and_emojis():
     from w1x import clipboard
 
